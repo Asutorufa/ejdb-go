@@ -13,11 +13,16 @@ type Tx struct {
 
 func (db *DB) ReadTx(fn func(*Tx) error) error {
 	db.mu.RLock()
-	defer db.mu.RUnlock()
 	if db.closed {
+		db.mu.RUnlock()
 		return ErrClosed
 	}
-	return fn(&Tx{db: db, state: db.state, write: false})
+	snapshot, err := db.state.clone()
+	db.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return fn(&Tx{db: db, state: snapshot, write: false})
 }
 
 func (db *DB) WriteTx(fn func(*Tx) error) error {

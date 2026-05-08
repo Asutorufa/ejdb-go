@@ -23,6 +23,7 @@ const (
 	CodeLimitAlreadySet    ErrorCode = "JQL_LIMIT_ALREADY_SET"
 	CodeOrderByMaxLimit    ErrorCode = "JQL_ORDERBY_MAX_LIMIT"
 	CodeInvalidValueType   ErrorCode = "JQL_INVALID_VALUE_TYPE"
+	CodeIncompatibleFormat ErrorCode = "EJDB_INCOMPATIBLE_FORMAT"
 )
 
 type Error struct {

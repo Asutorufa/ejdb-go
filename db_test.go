@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -100,6 +101,42 @@ func TestPebblePersistenceReopenAndBackup(t *testing.T) {
 		t.Fatalf("get from backup: %v", err)
 	}
 	assertJSONEqual(t, got, `{"email":"a@example.com","name":"a","age":20}`)
+}
+
+func TestDocumentsPersistAsEJBLBinary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.pebble")
+	db := mustOpen(t, path)
+
+	id, err := db.PutNew("docs", []byte(`{"s":"hello","i":-7,"f":1.5,"b":true,"n":null,"a":[1,"x"],"o":{"k":"v"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.engine.Get(keyDoc("docs", id))
+	if err != nil {
+		t.Fatalf("read stored doc: %v", err)
+	}
+	if !isJBLDocument(stored) {
+		t.Fatalf("document value is not EJBL binary: %x", stored[:min(len(stored), 8)])
+	}
+	if json.Valid(stored) {
+		t.Fatalf("document value should not be stored as JSON: %s", stored)
+	}
+	raw, _, err := decodeStoredDocument(stored)
+	if err != nil {
+		t.Fatalf("decode stored doc: %v", err)
+	}
+	assertJSONEqual(t, raw, `{"s":"hello","i":-7,"f":1.5,"b":true,"n":null,"a":[1,"x"],"o":{"k":"v"}}`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db = mustOpen(t, path)
+	defer db.Close()
+	got, err := db.Get("docs", id)
+	if err != nil {
+		t.Fatalf("get after reopen: %v", err)
+	}
+	assertJSONEqual(t, got, `{"s":"hello","i":-7,"f":1.5,"b":true,"n":null,"a":[1,"x"],"o":{"k":"v"}}`)
 }
 
 func TestUniqueIndexConflictRollback(t *testing.T) {
@@ -226,6 +263,76 @@ func TestReadWriteTxIsolationAndRollback(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReadTxSnapshotAllowsConcurrentWrite(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	id, err := db.PutNew("users", []byte(`{"name":"before"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.ReadTx(func(tx *Tx) error {
+		if err := db.Put("users", id, []byte(`{"name":"after"}`)); err != nil {
+			return err
+		}
+		got, err := tx.Get("users", id)
+		if err != nil {
+			return err
+		}
+		assertJSONEqual(t, got, `{"name":"before"}`)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read tx: %v", err)
+	}
+	got, err := db.Get("users", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, got, `{"name":"after"}`)
+}
+
+func TestUnsupportedFormatVersionDoesNotClearData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.pebble")
+	eng := NewPebbleEngine(nil)
+	if err := eng.Open(path); err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	oldMeta := []byte(`{"format_version":1,"version":"old","next_collection_id":1,"created_at_unix_nano":1,"collections":{}}`)
+	if err := eng.Set(keyMetaState, oldMeta); err != nil {
+		t.Fatalf("write old metadata: %v", err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+
+	db, err := Open(Options{Path: path})
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("expected incompatible format error")
+	}
+	if !errors.Is(err, &Error{Code: CodeIncompatibleFormat}) {
+		t.Fatalf("expected incompatible format error, got %v", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("database directory should not be removed: %v", statErr)
+	}
+	eng = NewPebbleEngine(nil)
+	if err := eng.Open(path); err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	got, err := eng.Get(keyMetaState)
+	if err != nil {
+		t.Fatalf("old metadata should remain: %v", err)
+	}
+	if string(got) != string(oldMeta) {
+		t.Fatalf("old metadata changed: %s", got)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
 	}
 }
 
@@ -462,6 +569,25 @@ func TestOfficialPlannerRangePrefixAndComparison(t *testing.T) {
 	if want := []int{-1, 0, 1}; !reflect.DeepEqual(nums, want) {
 		t.Fatalf("range docs got=%v want=%v", nums, want)
 	}
+	for _, rt := range db.state.Collections["nums"].runtime {
+		rt.unique = map[string]int64{}
+		rt.multi = map[string]map[int64]struct{}{}
+	}
+	docs, err = db.ListQuery(mustQuery(t, "nums", "/[v >= -1 and v < 2] | asc /v"), 0)
+	if err != nil {
+		t.Fatalf("range list after runtime cache clear: %v", err)
+	}
+	nums = nums[:0]
+	for _, doc := range docs {
+		var m map[string]any
+		if err := json.Unmarshal(doc.Raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		nums = append(nums, int(m["v"].(float64)))
+	}
+	if want := []int{-1, 0, 1}; !reflect.DeepEqual(nums, want) {
+		t.Fatalf("pebble iterator range got=%v want=%v", nums, want)
+	}
 
 	if err := db.EnsureIndexMode("names", "/lastName", IdxString); err != nil {
 		t.Fatal(err)
@@ -525,6 +651,39 @@ func TestOfficialJQLParserErrors(t *testing.T) {
 	}
 }
 
+func TestOfficialJQLPlaceholderInArrayTypes(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.EnsureIndexMode("items", "/v", IdxInt64); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int{1, 2, 3} {
+		if _, err := db.PutNew("items", []byte(fmt.Sprintf(`{"v":%d}`, v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q := mustQuery(t, "items", "/[v in :?] | asc /v")
+	if err := q.SetJSON("", 0, []int64{1, 3}); err != nil {
+		t.Fatal(err)
+	}
+	docs, err := db.ListQuery(q, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var got []int
+	for _, doc := range docs {
+		var m map[string]any
+		if err := json.Unmarshal(doc.Raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, int(m["v"].(float64)))
+	}
+	if want := []int{1, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("placeholder in got=%v want=%v", got, want)
+	}
+}
+
 func TestOfficialJQLCoreMatchingCases(t *testing.T) {
 	assertJQLMatch(t, "{}", "/*", true)
 	assertJQLMatch(t, "{}", "/**", true)
@@ -551,4 +710,6 @@ func TestOfficialJQLCoreMatchingCases(t *testing.T) {
 	assertJQLMatch(t, "{'lastName':'Doe'}", "/[lastName ~ 'Do']", true)
 	assertJQLMatch(t, "{'lastName':'Smith'}", "/[lastName ~ 'Do']", false)
 	assertJQLMatch(t, "{'foo bar':22}", `/"foo bar"`, true)
+	assertJQLMatch(t, "{'foo/bar':22}", `/foo\/bar`, true)
+	assertJQLMatch(t, "{'snowman ☃':22}", `/snowman\u0020\u2603`, true)
 }

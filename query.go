@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -183,8 +182,10 @@ type filterNode interface {
 }
 
 type candidatePlan struct {
-	ids        []int64
 	index      *indexRuntime
+	idx        indexState
+	op         string
+	value      any
 	weight     int
 	explain    string
 	cursorInit string
@@ -199,7 +200,7 @@ func betterCandidate(a candidatePlan, aok bool, b candidatePlan, bok bool) (cand
 		return a, aok
 	case b.weight > a.weight:
 		return b, true
-	case b.weight == a.weight && len(b.ids) < len(a.ids):
+	case b.weight == a.weight && b.index != nil && a.index != nil && b.index.def.Unique && !a.index.def.Unique:
 		return b, true
 	default:
 		return a, true
@@ -344,9 +345,18 @@ func (f queryFilter) candidate(col *collectionState, q *Query) (candidatePlan, b
 		if rt.def.Path != path {
 			continue
 		}
-		plan, ok := candidateFromRuntimeIndex(rt, cmp.cmp.op, val)
+		weight, cursorInit, cursorStep, ok := indexOpPlan(rt.def, cmp.cmp.op, val)
 		if !ok {
 			continue
+		}
+		plan := candidatePlan{
+			index:      rt,
+			idx:        rt.def,
+			op:         cmp.cmp.op,
+			value:      val,
+			weight:     weight,
+			cursorInit: cursorInit,
+			cursorStep: cursorStep,
 		}
 		plan.explain = fmt.Sprintf("%s %s %v", path, cmp.cmp.op, val)
 		best, bestOK = betterCandidate(best, bestOK, plan, true)
@@ -363,91 +373,44 @@ func isIndexableOp(op string) bool {
 	}
 }
 
-func candidateFromRuntimeIndex(rt *indexRuntime, op string, val any) (candidatePlan, bool) {
-	weight := 0
+func indexOpPlan(idx indexState, op string, val any) (weight int, cursorInit string, cursorStep string, ok bool) {
 	switch op {
 	case "=":
-		weight = 100
+		if _, ok := normalizeIndexValue(val, idx.Kind); !ok {
+			return 0, "", "", false
+		}
+		return 100, "IWKV_CURSOR_EQ", "IWKV_CURSOR_NEXT", true
 	case "in":
-		weight = 90
-	case "prefix":
-		weight = 60
-	case ">", ">=", "<", "<=":
-		weight = 70
-	default:
-		return candidatePlan{}, false
-	}
-	ids := make(map[int64]struct{})
-	addKey := func(k string) {
-		if rt.def.Unique {
-			if id, ok := rt.unique[k]; ok {
-				ids[id] = struct{}{}
-			}
-			return
-		}
-		for id := range rt.multi[k] {
-			ids[id] = struct{}{}
-		}
-	}
-	switch op {
-	case "=":
-		k, ok := normalizeIndexValue(val, rt.def.Kind)
+		arr, ok := toAnySlice(val)
 		if !ok {
-			return candidatePlan{}, false
-		}
-		addKey(k)
-	case "in":
-		arr, ok := val.([]any)
-		if !ok {
-			return candidatePlan{}, false
+			return 0, "", "", false
 		}
 		for _, it := range arr {
-			if k, ok := normalizeIndexValue(it, rt.def.Kind); ok {
-				addKey(k)
+			if _, ok := normalizeIndexValue(it, idx.Kind); ok {
+				return 90, "IWKV_CURSOR_EQ", "IWKV_CURSOR_NEXT", true
 			}
 		}
+		return 0, "", "", false
 	case "prefix":
-		if rt.def.Kind != IndexString {
-			return candidatePlan{}, false
+		if idx.Kind != IndexString {
+			return 0, "", "", false
 		}
 		prefix, ok := jqPrefixString(toJQValue(val))
-		if !ok {
-			return candidatePlan{}, false
+		if !ok || prefix == "" {
+			return 0, "", "", false
 		}
-		for k := range allRuntimeIndexKeys(rt) {
-			if strings.HasPrefix(k, prefix) {
-				addKey(k)
-			}
-		}
+		return 60, "IWKV_CURSOR_GE", "IWKV_CURSOR_NEXT", true
 	case ">", ">=", "<", "<=":
-		bound, ok := normalizeIndexValue(val, rt.def.Kind)
-		if !ok {
-			return candidatePlan{}, false
+		if _, ok := normalizeIndexValue(val, idx.Kind); !ok {
+			return 0, "", "", false
 		}
-		for k := range allRuntimeIndexKeys(rt) {
-			cmp := compareIndexKeys(rt.def.Kind, k, bound)
-			if (op == ">" && cmp > 0) || (op == ">=" && cmp >= 0) || (op == "<" && cmp < 0) || (op == "<=" && cmp <= 0) {
-				addKey(k)
-			}
+		if op == ">" || op == ">=" {
+			return 70, "IWKV_CURSOR_GE", "IWKV_CURSOR_PREV", true
 		}
+		return 50, "IWKV_CURSOR_GE", "IWKV_CURSOR_NEXT", true
+	default:
+		return 0, "", "", false
 	}
-	res := make([]int64, 0, len(ids))
-	for id := range ids {
-		res = append(res, id)
-	}
-	sort.Slice(res, func(i, j int) bool { return res[i] < res[j] })
-	return candidatePlan{ids: res, index: rt, weight: weight, cursorInit: "IWKV_CURSOR_GE", cursorStep: "IWKV_CURSOR_NEXT"}, true
-}
-
-func allRuntimeIndexKeys(rt *indexRuntime) map[string]struct{} {
-	keys := make(map[string]struct{}, len(rt.unique)+len(rt.multi))
-	for k := range rt.unique {
-		keys[k] = struct{}{}
-	}
-	for k := range rt.multi {
-		keys[k] = struct{}{}
-	}
-	return keys
 }
 
 type exprNode interface {
@@ -1568,7 +1531,9 @@ func parseJQLPathTokens(path string) ([]string, error) {
 	tokens := make([]string, 0, 4)
 	var b strings.Builder
 	escaped := false
-	for _, r := range path[1:] {
+	runes := []rune(path[1:])
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
 		if escaped {
 			switch r {
 			case '\\', '/', '{', '}', ',', ' ', '\t', '\n', '\r':
@@ -1583,6 +1548,17 @@ func parseJQLPathTokens(path string) ([]string, error) {
 				b.WriteByte('\r')
 			case 't':
 				b.WriteByte('\t')
+			case 'u':
+				if i+4 >= len(runes) {
+					return nil, fmt.Errorf("short unicode path escape")
+				}
+				hex := string(runes[i+1 : i+5])
+				u, err := strconv.ParseInt(hex, 16, 32)
+				if err != nil {
+					return nil, fmt.Errorf("invalid unicode path escape: %s", hex)
+				}
+				b.WriteRune(rune(u))
+				i += 4
 			default:
 				b.WriteRune(r)
 			}
@@ -1788,7 +1764,7 @@ func compareValues(left any, op string, right any) (bool, error) {
 			return ord <= 0, nil
 		}
 	case "in":
-		arr, ok := right.([]any)
+		arr, ok := toAnySlice(right)
 		if !ok {
 			return false, nil
 		}
@@ -1972,5 +1948,44 @@ func toIDSlice(v any) ([]int64, error) {
 			return nil, withCodef(CodeInvalidQuery, "invalid id value: %v", v)
 		}
 		return []int64{i}, nil
+	}
+}
+
+func toAnySlice(v any) ([]any, bool) {
+	switch x := v.(type) {
+	case []any:
+		return x, true
+	case []string:
+		out := make([]any, len(x))
+		for i, v := range x {
+			out[i] = v
+		}
+		return out, true
+	case []int:
+		out := make([]any, len(x))
+		for i, v := range x {
+			out[i] = v
+		}
+		return out, true
+	case []int64:
+		out := make([]any, len(x))
+		for i, v := range x {
+			out[i] = v
+		}
+		return out, true
+	case []float64:
+		out := make([]any, len(x))
+		for i, v := range x {
+			out[i] = v
+		}
+		return out, true
+	case []json.Number:
+		out := make([]any, len(x))
+		for i, v := range x {
+			out[i] = v
+		}
+		return out, true
+	default:
+		return nil, false
 	}
 }

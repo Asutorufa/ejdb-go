@@ -14,6 +14,8 @@ import (
 
 var keyMetaState = []byte("meta/state")
 
+const currentFormatVersion = 3
+
 const (
 	keyTagDoc  byte = 0x10
 	keyTagSeq  byte = 0x11
@@ -260,7 +262,7 @@ type catalogCollection struct {
 
 func catalogFromState(s *dbState) catalogState {
 	cat := catalogState{
-		FormatVersion:    1,
+		FormatVersion:    currentFormatVersion,
 		Version:          s.Version,
 		NextCollectionID: s.NextCollectionID,
 		CreatedAt:        s.CreatedAt.UnixNano(),
@@ -318,6 +320,9 @@ func decodeCatalog(raw []byte) (*dbState, error) {
 	if err := json.Unmarshal(raw, &cat); err != nil {
 		return nil, err
 	}
+	if cat.FormatVersion != currentFormatVersion {
+		return nil, withCodef(CodeIncompatibleFormat, "unsupported storage format version %d, expected %d", cat.FormatVersion, currentFormatVersion)
+	}
 	return stateFromCatalog(cat), nil
 }
 
@@ -342,19 +347,33 @@ func keyUniqueIndexPrefix(collection string) []byte {
 	return appendSegment([]byte{keyTagUIdx}, collection)
 }
 
-func keyIndex(collection string, idx indexState, value string, id int64) []byte {
+func keyIndexPathPrefix(collection string, idx indexState) []byte {
 	k := keyIndexPrefix(collection)
 	k = appendSegment(k, string(idx.Kind))
-	k = appendSegment(k, idx.Path)
-	k = appendSegment(k, value)
+	return appendSegment(k, idx.Path)
+}
+
+func keyUniqueIndexPathPrefix(collection string, idx indexState) []byte {
+	k := keyUniqueIndexPrefix(collection)
+	k = appendSegment(k, string(idx.Kind))
+	return appendSegment(k, idx.Path)
+}
+
+func keyIndexValuePrefix(collection string, idx indexState, value string) []byte {
+	return appendSegment(keyIndexPathPrefix(collection, idx), value)
+}
+
+func keyUniqueIndexValuePrefix(collection string, idx indexState, value string) []byte {
+	return appendSegment(keyUniqueIndexPathPrefix(collection, idx), value)
+}
+
+func keyIndex(collection string, idx indexState, value string, id int64) []byte {
+	k := keyIndexValuePrefix(collection, idx, value)
 	return appendI64(k, id)
 }
 
 func keyUniqueIndex(collection string, idx indexState, value string) []byte {
-	k := keyUniqueIndexPrefix(collection)
-	k = appendSegment(k, string(idx.Kind))
-	k = appendSegment(k, idx.Path)
-	return appendSegment(k, value)
+	return keyUniqueIndexValuePrefix(collection, idx, value)
 }
 
 func appendSegment(dst []byte, s string) []byte {
@@ -404,6 +423,58 @@ func decodeDocKey(key []byte) (string, int64, bool) {
 	}
 	id, ok := readI64(key, &off)
 	return coll, id, ok && off == len(key)
+}
+
+func decodeIndexKey(key []byte) (collection string, kind IndexKind, path string, value string, id int64, ok bool) {
+	if len(key) == 0 || key[0] != keyTagIdx {
+		return "", "", "", "", 0, false
+	}
+	off := 1
+	collection, ok = readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", 0, false
+	}
+	kindRaw, ok := readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", 0, false
+	}
+	path, ok = readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", 0, false
+	}
+	value, ok = readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", 0, false
+	}
+	id, ok = readI64(key, &off)
+	if !ok || off != len(key) {
+		return "", "", "", "", 0, false
+	}
+	return collection, IndexKind(kindRaw), path, value, id, true
+}
+
+func decodeUniqueIndexKey(key []byte) (collection string, kind IndexKind, path string, value string, ok bool) {
+	if len(key) == 0 || key[0] != keyTagUIdx {
+		return "", "", "", "", false
+	}
+	off := 1
+	collection, ok = readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", false
+	}
+	kindRaw, ok := readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", false
+	}
+	path, ok = readSegment(key, &off)
+	if !ok {
+		return "", "", "", "", false
+	}
+	value, ok = readSegment(key, &off)
+	if !ok || off != len(key) {
+		return "", "", "", "", false
+	}
+	return collection, IndexKind(kindRaw), path, value, true
 }
 
 func prefixEnd(prefix []byte) []byte {

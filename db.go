@@ -122,11 +122,15 @@ func (db *DB) loadDocs() error {
 		if !ok {
 			return withCode(CodeInvalidQuery, "invalid document key in storage")
 		}
+		raw, _, err := decodeStoredDocument(value)
+		if err != nil {
+			return err
+		}
 		col, ok := db.state.Collections[collName]
 		if !ok {
 			col = db.ensureCollectionOnStateLocked(db.state, collName)
 		}
-		col.Docs[id] = append(json.RawMessage(nil), value...)
+		col.Docs[id] = raw
 		if id > col.NextID {
 			col.NextID = id
 		}
@@ -443,6 +447,11 @@ type matchedDoc struct {
 	spillSize   int64
 }
 
+type queryReader interface {
+	Get(key []byte) ([]byte, error)
+	NewIterator(lower, upper []byte) (StorageIterator, error)
+}
+
 type sortSpill struct {
 	file *os.File
 	path string
@@ -612,6 +621,14 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		}
 		sortPaths = append(sortPaths, path)
 	}
+	useStorage := db.canUseStorageQuery(state)
+	var reader queryReader
+	var snap StorageSnapshot
+	if useStorage {
+		snap = db.engine.NewSnapshot()
+		reader = snap
+		defer snap.Close()
+	}
 	var candidateIDs []int64
 	var candidate candidatePlan
 	usedIndex := false
@@ -619,29 +636,61 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 	if !pq.noidx {
 		if plan, ok := pq.filter.candidate(col, q); ok {
 			candidate = plan
-			candidateIDs = plan.ids
 			usedIndex = true
+			var err error
+			orderByCandidate := len(sortPaths) == 1 && plan.idx.Path == sortPaths[0]
+			if useStorage {
+				candidateIDs, err = db.scanIndexCandidateIDs(reader, collection, plan, orderByCandidate && pq.sorts[0].desc)
+			} else {
+				candidateIDs = memoryIndexCandidateIDs(plan)
+				if orderByCandidate {
+					candidateIDs = orderIDsByRuntimeIndex(plan.index, candidateIDs, pq.sorts[0].desc)
+				}
+			}
+			if err != nil {
+				return nil, 0, false, err
+			}
+			usedOrderIndex = orderByCandidate
 		}
-		if plan, ok := chooseOrderByIndexIDs(col, sortPaths, pq.sorts, usedIndex, candidate); ok {
-			candidate = plan
-			candidateIDs = plan.ids
-			usedOrderIndex = true
-			usedIndex = true
+		if !usedIndex && len(sortPaths) == 1 {
+			if plan, ok := chooseOrderByIndexPlan(col, sortPaths[0], pq.sorts[0].desc); ok {
+				candidate = plan
+				var err error
+				if useStorage {
+					candidateIDs, err = db.scanIndexCandidateIDs(reader, collection, plan, pq.sorts[0].desc)
+				} else {
+					candidateIDs = orderedIDsFromIndex(plan.index, pq.sorts[0].desc)
+				}
+				if err != nil {
+					return nil, 0, false, err
+				}
+				usedOrderIndex = true
+				usedIndex = true
+			}
 		}
 	}
 	if candidateIDs == nil {
-		candidateIDs = make([]int64, 0, len(col.Docs))
-		for id := range col.Docs {
-			candidateIDs = append(candidateIDs, id)
+		var err error
+		if useStorage {
+			candidateIDs, err = db.scanDocumentIDs(reader, collection)
+			if err != nil {
+				return nil, 0, false, err
+			}
+		} else {
+			candidateIDs = make([]int64, 0, len(col.Docs))
+			for id := range col.Docs {
+				candidateIDs = append(candidateIDs, id)
+			}
+			sort.Slice(candidateIDs, func(i, j int) bool { return candidateIDs[i] < candidateIDs[j] })
 		}
-		sort.Slice(candidateIDs, func(i, j int) bool { return candidateIDs[i] < candidateIDs[j] })
 	}
 	if opts.Log != nil {
 		if usedIndex {
+			_, _ = opts.Log.WriteString("[INDEX] MATCHED  " + candidatePlanLog(candidate, usedOrderIndex) + "\n")
 			if usedOrderIndex {
-				_, _ = opts.Log.WriteString("[INDEX] SELECTED " + indexPlanLog(candidate.index, candidate.explain, true) + "\n")
+				_, _ = opts.Log.WriteString("[INDEX] SELECTED " + candidatePlanLog(candidate, true) + "\n")
 			} else {
-				_, _ = opts.Log.WriteString("[INDEX] SELECTED " + indexPlanLog(candidate.index, candidate.explain, false) + "\n")
+				_, _ = opts.Log.WriteString("[INDEX] SELECTED " + candidatePlanLog(candidate, false) + "\n")
 			}
 		}
 		if len(sortPaths) > 0 && !usedOrderIndex {
@@ -661,16 +710,22 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 	var bufferedSortBytes int64
 	matchedDocs := make([]matchedDoc, 0, len(candidateIDs))
 	for _, id := range candidateIDs {
-		raw := col.Docs[id]
+		raw, ok, err := db.rawForQueryDoc(reader, col, collection, id, useStorage)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if !ok {
+			continue
+		}
 		var node any
 		if err := decodeJSONDocument(raw, &node); err != nil {
 			return nil, 0, false, err
 		}
-		ok, err := pq.filter.match(node, id, q, state)
+		matches, err := pq.filter.match(node, id, q, state)
 		if err != nil {
 			return nil, 0, false, err
 		}
-		if ok {
+		if matches {
 			m := matchedDoc{id: id, raw: append(json.RawMessage(nil), raw...), node: node}
 			if willSort {
 				m.sortValues = make([]any, len(sortPaths))
@@ -696,7 +751,9 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		}
 	}
 
-	if len(pq.sorts) > 0 && !usedOrderIndex {
+	if usedOrderIndex {
+		// The candidate iterator already produced documents in the requested index order.
+	} else if len(pq.sorts) > 0 {
 		sort.Slice(matchedDocs, func(i, j int) bool {
 			li := matchedDocs[i]
 			lj := matchedDocs[j]
@@ -817,45 +874,299 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 	return docs, int64(len(docs)), changed, nil
 }
 
-func chooseOrderByIndexIDs(col *collectionState, sortPaths []string, sorts []querySort, usedFilterIndex bool, filterPlan candidatePlan) (candidatePlan, bool) {
-	if len(sortPaths) != 1 || len(sorts) != 1 {
-		return candidatePlan{}, false
-	}
-	sortPath := sortPaths[0]
-	desc := sorts[0].desc
-	if usedFilterIndex {
-		if filterPlan.index == nil || filterPlan.index.def.Path != sortPath {
-			return candidatePlan{}, false
-		}
-		allowed := make(map[int64]struct{}, len(filterPlan.ids))
-		for _, id := range filterPlan.ids {
-			allowed[id] = struct{}{}
-		}
-		ordered := orderedIDsFromIndex(filterPlan.index, desc)
-		out := make([]int64, 0, len(filterPlan.ids))
-		seen := make(map[int64]struct{}, len(filterPlan.ids))
-		for _, id := range ordered {
-			if _, ok := allowed[id]; !ok {
-				continue
+func (db *DB) canUseStorageQuery(state *dbState) bool {
+	return state == db.state && len(db.pending) == 0 && !db.dirtyFull
+}
+
+func (db *DB) rawForQueryDoc(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (json.RawMessage, bool, error) {
+	if useStorage {
+		stored, err := reader.Get(keyDoc(collection, id))
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, false, nil
 			}
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			seen[id] = struct{}{}
-			out = append(out, id)
+			return nil, false, err
 		}
-		filterPlan.ids = out
-		filterPlan.explain = sortPath
-		return filterPlan, true
+		raw, _, err := decodeStoredDocument(stored)
+		if err != nil {
+			return nil, false, err
+		}
+		return raw, true, nil
 	}
-	rt := findOrderByIndex(col, sortPath)
+	raw, ok := col.Docs[id]
+	if !ok {
+		return nil, false, nil
+	}
+	return append(json.RawMessage(nil), raw...), true, nil
+}
+
+func (db *DB) scanDocumentIDs(reader queryReader, collection string) ([]int64, error) {
+	prefix := keyDocPrefix(collection)
+	ids := make([]int64, 0)
+	err := scanPrefix(reader, prefix, func(key, _ []byte) error {
+		_, id, ok := decodeDocKey(key)
+		if !ok {
+			return withCode(CodeInvalidQuery, "invalid document key in storage")
+		}
+		ids = append(ids, id)
+		return nil
+	})
+	return ids, err
+}
+
+func chooseOrderByIndexPlan(col *collectionState, path string, desc bool) (candidatePlan, bool) {
+	rt := findOrderByIndex(col, path)
 	if rt == nil {
 		return candidatePlan{}, false
 	}
-	return candidatePlan{ids: orderedIDsFromIndex(rt, desc), index: rt, weight: 80, explain: sortPath, cursorInit: "IWKV_CURSOR_AFTER_LAST", cursorStep: "IWKV_CURSOR_PREV"}, true
+	init := "IWKV_CURSOR_AFTER_LAST"
+	step := "IWKV_CURSOR_PREV"
+	if desc {
+		init = "IWKV_CURSOR_BEFORE_FIRST"
+		step = "IWKV_CURSOR_NEXT"
+	}
+	return candidatePlan{
+		index:      rt,
+		idx:        rt.def,
+		weight:     80,
+		explain:    path,
+		cursorInit: init,
+		cursorStep: step,
+	}, true
 }
 
-func indexPlanLog(rt *indexRuntime, expr string, orderBy bool) string {
+func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan candidatePlan, desc bool) ([]int64, error) {
+	if plan.index == nil {
+		return nil, nil
+	}
+	idx := plan.idx
+	if idx.Path == "" {
+		idx = plan.index.def
+	}
+	seen := make(map[int64]struct{})
+	out := make([]int64, 0)
+	addID := func(id int64) {
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	scanNonUniqueValue := func(value string) error {
+		return scanPrefix(reader, keyIndexValuePrefix(collection, idx, value), func(key, _ []byte) error {
+			_, kind, path, _, id, ok := decodeIndexKey(key)
+			if !ok || kind != idx.Kind || path != idx.Path {
+				return withCode(CodeInvalidQuery, "invalid index key in storage")
+			}
+			addID(id)
+			return nil
+		})
+	}
+	addUniqueValue := func(value string) error {
+		raw, err := reader.Get(keyUniqueIndex(collection, idx, value))
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		id, err := parseU64(raw)
+		if err != nil {
+			return err
+		}
+		addID(int64(id))
+		return nil
+	}
+	scanPath := func(match func(value string) bool) error {
+		if idx.Unique {
+			return scanPrefix(reader, keyUniqueIndexPathPrefix(collection, idx), func(key, value []byte) error {
+				_, kind, path, indexedValue, ok := decodeUniqueIndexKey(key)
+				if !ok || kind != idx.Kind || path != idx.Path {
+					return withCode(CodeInvalidQuery, "invalid unique index key in storage")
+				}
+				if !match(indexedValue) {
+					return nil
+				}
+				id, err := parseU64(value)
+				if err != nil {
+					return err
+				}
+				addID(int64(id))
+				return nil
+			})
+		}
+		return scanPrefix(reader, keyIndexPathPrefix(collection, idx), func(key, _ []byte) error {
+			_, kind, path, indexedValue, id, ok := decodeIndexKey(key)
+			if !ok || kind != idx.Kind || path != idx.Path {
+				return withCode(CodeInvalidQuery, "invalid index key in storage")
+			}
+			if match(indexedValue) {
+				addID(id)
+			}
+			return nil
+		})
+	}
+	switch plan.op {
+	case "":
+		if err := scanPath(func(string) bool { return true }); err != nil {
+			return nil, err
+		}
+	case "=":
+		value, ok := normalizeIndexValue(plan.value, idx.Kind)
+		if !ok {
+			return nil, nil
+		}
+		if idx.Unique {
+			if err := addUniqueValue(value); err != nil {
+				return nil, err
+			}
+		} else if err := scanNonUniqueValue(value); err != nil {
+			return nil, err
+		}
+	case "in":
+		arr, ok := toAnySlice(plan.value)
+		if !ok {
+			return nil, nil
+		}
+		for _, it := range arr {
+			value, ok := normalizeIndexValue(it, idx.Kind)
+			if !ok {
+				continue
+			}
+			if idx.Unique {
+				if err := addUniqueValue(value); err != nil {
+					return nil, err
+				}
+			} else if err := scanNonUniqueValue(value); err != nil {
+				return nil, err
+			}
+		}
+	case "prefix":
+		prefix, ok := jqPrefixString(toJQValue(plan.value))
+		if !ok {
+			return nil, nil
+		}
+		if err := scanPath(func(value string) bool { return strings.HasPrefix(value, prefix) }); err != nil {
+			return nil, err
+		}
+	case ">", ">=", "<", "<=":
+		bound, ok := normalizeIndexValue(plan.value, idx.Kind)
+		if !ok {
+			return nil, nil
+		}
+		if err := scanPath(func(value string) bool {
+			cmp := compareIndexKeys(idx.Kind, value, bound)
+			return (plan.op == ">" && cmp > 0) ||
+				(plan.op == ">=" && cmp >= 0) ||
+				(plan.op == "<" && cmp < 0) ||
+				(plan.op == "<=" && cmp <= 0)
+		}); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, nil
+	}
+	if desc {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	return out, nil
+}
+
+func memoryIndexCandidateIDs(plan candidatePlan) []int64 {
+	if plan.index == nil {
+		return nil
+	}
+	rt := plan.index
+	ids := make(map[int64]struct{})
+	addKey := func(k string) {
+		if rt.def.Unique {
+			if id, ok := rt.unique[k]; ok {
+				ids[id] = struct{}{}
+			}
+			return
+		}
+		for id := range rt.multi[k] {
+			ids[id] = struct{}{}
+		}
+	}
+	switch plan.op {
+	case "=":
+		if k, ok := normalizeIndexValue(plan.value, rt.def.Kind); ok {
+			addKey(k)
+		}
+	case "in":
+		if arr, ok := toAnySlice(plan.value); ok {
+			for _, it := range arr {
+				if k, ok := normalizeIndexValue(it, rt.def.Kind); ok {
+					addKey(k)
+				}
+			}
+		}
+	case "prefix":
+		prefix, ok := jqPrefixString(toJQValue(plan.value))
+		if ok {
+			for k := range allRuntimeIndexKeys(rt) {
+				if strings.HasPrefix(k, prefix) {
+					addKey(k)
+				}
+			}
+		}
+	case ">", ">=", "<", "<=":
+		if bound, ok := normalizeIndexValue(plan.value, rt.def.Kind); ok {
+			for k := range allRuntimeIndexKeys(rt) {
+				cmp := compareIndexKeys(rt.def.Kind, k, bound)
+				if (plan.op == ">" && cmp > 0) || (plan.op == ">=" && cmp >= 0) || (plan.op == "<" && cmp < 0) || (plan.op == "<=" && cmp <= 0) {
+					addKey(k)
+				}
+			}
+		}
+	case "":
+		return orderedIDsFromIndex(rt, false)
+	}
+	res := make([]int64, 0, len(ids))
+	for id := range ids {
+		res = append(res, id)
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i] < res[j] })
+	return res
+}
+
+func allRuntimeIndexKeys(rt *indexRuntime) map[string]struct{} {
+	keys := make(map[string]struct{}, len(rt.unique)+len(rt.multi))
+	for k := range rt.unique {
+		keys[k] = struct{}{}
+	}
+	for k := range rt.multi {
+		keys[k] = struct{}{}
+	}
+	return keys
+}
+
+func orderIDsByRuntimeIndex(rt *indexRuntime, ids []int64, desc bool) []int64 {
+	allowed := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		allowed[id] = struct{}{}
+	}
+	ordered := orderedIDsFromIndex(rt, desc)
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ordered {
+		if _, ok := allowed[id]; !ok {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func candidatePlanLog(plan candidatePlan, orderBy bool) string {
+	rt := plan.index
 	if rt == nil {
 		if orderBy {
 			return "ORDERBY"
@@ -880,8 +1191,14 @@ func indexPlanLog(rt *indexRuntime, expr string, orderBy bool) string {
 		parts = append(parts, "INDEX")
 	}
 	out := strings.Join(parts, "|") + " " + rt.def.Path
-	if expr != "" {
-		out += " EXPR1: '" + expr + "'"
+	if plan.explain != "" {
+		out += " EXPR1: '" + plan.explain + "'"
+	}
+	if plan.cursorInit != "" {
+		out += " INIT: " + plan.cursorInit
+	}
+	if plan.cursorStep != "" {
+		out += " STEP: " + plan.cursorStep
 	}
 	if orderBy {
 		out += " ORDERBY"
@@ -1294,6 +1611,14 @@ func normalizeRawJSON(raw []byte) (json.RawMessage, any, error) {
 	return canon, doc, nil
 }
 
+func (db *DB) encodeStoredRaw(raw []byte) ([]byte, error) {
+	var doc any
+	if err := decodeJSONDocument(raw, &doc); err != nil {
+		return nil, err
+	}
+	return encodeStoredDocument(doc)
+}
+
 func decodeJSONDocument(raw []byte, out *any) error {
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.UseNumber()
@@ -1564,7 +1889,11 @@ func (db *DB) persistPendingLocked() error {
 					return err
 				}
 			}
-			if err := b.Set(keyDoc(m.collection, m.id), m.newRaw); err != nil {
+			stored, err := db.encodeStoredRaw(m.newRaw)
+			if err != nil {
+				return err
+			}
+			if err := b.Set(keyDoc(m.collection, m.id), stored); err != nil {
 				return err
 			}
 			if err := db.setIndexKeys(b, m.collection, m.id, m.newRaw); err != nil {
@@ -1652,7 +1981,11 @@ func (db *DB) persistFullLocked() error {
 			return err
 		}
 		for id, raw := range col.Docs {
-			if err := b.Set(keyDoc(name, id), raw); err != nil {
+			stored, err := db.encodeStoredRaw(raw)
+			if err != nil {
+				return err
+			}
+			if err := b.Set(keyDoc(name, id), stored); err != nil {
 				return err
 			}
 			var doc any

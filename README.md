@@ -10,9 +10,13 @@ The on-disk format is this project's own Pebble key/value layout:
 
 - `meta/state`: catalog, collection, and index metadata
 - `seq/<collection>`: collection auto-increment sequence
-- `doc/<collection>/<id>`: canonical JSON document
+- `doc/<collection>/<id>`: EJBL binary JSON document
 - `idx/<collection>/<mode>/<path>/<value>/<id>`: non-unique index entry
 - `uidx/<collection>/<mode>/<path>/<value>`: unique index entry
+
+The metadata contains a `format_version`. This implementation does not perform online migrations yet: opening an older or unknown format returns `EJDB_INCOMPATIBLE_FORMAT` and does not delete or rewrite the database directory.
+
+Documents are accepted and returned as JSON, but persisted as an internal EJBL binary encoding with typed null, bool, int64, float64, string, array, and object values. The Pebble file layout is still project-specific and is not binary-compatible with official EJDB2/IWKV database files.
 
 ## Features
 
@@ -23,7 +27,9 @@ The on-disk format is this project's own Pebble key/value layout:
 - Official-style order-by planning: a single `ORDERBY` with a matching index scans index order directly; otherwise the query uses a sorter
 - Sort overflow files: sorter input spills to a temporary file after `Options.SortBufferSize` bytes, defaulting to 16 MiB
 - Official-like JQL comparison semantics for null, bool, numbers, strings, arrays, and objects
+- EJBL binary document persistence with JSON input/output at the public API boundary
 - Indexed equality, `in`, range, and string prefix planning
+- Query candidate and order-by index scans read from Pebble snapshot iterators; in-memory index maps are only planner/constraint caches
 - Collection management: create, remove, rename
 - Document CRUD: `PutNew`, `Put`, `Get`, `Delete`, `Patch`, `MergeOrPut`
 - Indexes: `IdxUnique | IdxString/IdxInt64/IdxFloat`, including unique constraints and array element expansion
@@ -119,13 +125,13 @@ Sample environment:
 
 Latest sample:
 
-- `BenchmarkPutNew-10`: `4657 ns/op`, `218729 docs/s`, `218729 ops/s`, `4008 B/op`, `54 allocs/op`
-- `BenchmarkPutNewWriteTx-10`: `2006 ns/op`, `568544 docs/s`, `568544 ops/s`, `3779 B/op`, `44 allocs/op`
-- `BenchmarkGetByID-10`: `32.16 ns/op`, `31946468 docs/s`, `31946468 ops/s`, `31 B/op`, `1 allocs/op`
-- `BenchmarkQueryScanVsIndex/scan-10`: `5923565 ns/op`, `168.8 docs/s`, `168.8 ops/s`, `14559789 B/op`, `179747 allocs/op`
-- `BenchmarkQueryScanVsIndex/indexed-10`: `910.2 ns/op`, `1098662 docs/s`, `1098662 ops/s`, `1648 B/op`, `29 allocs/op`
-- `BenchmarkRangeQuery-10`: `14635008 ns/op`, `6965 docs/s`, `69.65 ops/s`, `16328087 B/op`, `209639 allocs/op`
-- `BenchmarkSortPagination-10`: `13562271 ns/op`, `3725 docs/s`, `74.49 ops/s`, `16002939 B/op`, `170147 allocs/op`
-- `BenchmarkUpdateDelete-10`: `17553 ns/op`, `116554 docs/s`, `58277 ops/s`, `18000 B/op`, `270 allocs/op`
+- `BenchmarkPutNew-10`: `5645 ns/op`, `180465 docs/s`, `180465 ops/s`, `5458 B/op`, `70 allocs/op`
+- `BenchmarkPutNewWriteTx-10`: `2573 ns/op`, `427670 docs/s`, `427670 ops/s`, `5208 B/op`, `60 allocs/op`
+- `BenchmarkGetByID-10`: `33.18 ns/op`, `30651327 docs/s`, `30651327 ops/s`, `31 B/op`, `1 allocs/op`
+- `BenchmarkQueryScanVsIndex/scan-10`: `17917958 ns/op`, `55.81 docs/s`, `55.81 ops/s`, `22897980 B/op`, `409713 allocs/op`
+- `BenchmarkQueryScanVsIndex/indexed-10`: `3625 ns/op`, `275864 docs/s`, `275864 ops/s`, `2776 B/op`, `65 allocs/op`
+- `BenchmarkRangeQuery-10`: `20493796 ns/op`, `4963 docs/s`, `49.63 ops/s`, `24895487 B/op`, `451026 allocs/op`
+- `BenchmarkSortPagination-10`: `18855000 ns/op`, `2702 docs/s`, `54.05 ops/s`, `24446640 B/op`, `411140 allocs/op`
+- `BenchmarkUpdateDelete-10`: `35503 ns/op`, `57425 docs/s`, `28713 ops/s`, `22720 B/op`, `365 allocs/op`
 
 Regular document writes, updates, and deletes use incremental Pebble batches. Structural operations such as collection rename, collection removal, and index rebuild still use a full refresh to keep the implementation simple and reliable.
