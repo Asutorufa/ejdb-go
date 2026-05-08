@@ -39,26 +39,26 @@ The on-disk format is this project's own Pebble key/value layout:
 package main
 
 import (
-	"fmt"
-	"log"
+ "fmt"
+ "log"
 
-	ejdb "github.com/softmotions/ejdb-go"
+ ejdb "github.com/Asutorufa/ejdb-go"
 )
 
 func main() {
-	db, err := ejdb.Open(ejdb.Options{Path: "demo.pebble"})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
+ db, err := ejdb.Open(ejdb.Options{Path: "demo.pebble"})
+ if err != nil {
+  log.Fatal(err)
+ }
+ defer db.Close()
 
-	_ = db.EnsureIndexMode("users", "/age", ejdb.IdxInt64)
-	_, _ = db.PutNew("users", []byte(`{"name":"alice","age":20}`))
+ _ = db.EnsureIndexMode("users", "/age", ejdb.IdxInt64)
+ _, _ = db.PutNew("users", []byte(`{"name":"alice","age":20}`))
 
-	q, _ := ejdb.NewQuery("users", "/[age >= :?] | asc /age")
-	_ = q.SetI64("", 0, 18)
-	res, _ := db.ListQuery(q, 0)
-	fmt.Println("hits:", len(res))
+ q, _ := ejdb.NewQuery("users", "/[age >= :?] | asc /age")
+ _ = q.SetI64("", 0, 18)
+ res, _ := db.ListQuery(q, 0)
+ fmt.Println("hits:", len(res))
 }
 ```
 

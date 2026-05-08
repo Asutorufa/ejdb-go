@@ -1,4 +1,4 @@
-module github.com/softmotions/ejdb-go
+module github.com/Asutorufa/ejdb-go
 
 go 1.23
 

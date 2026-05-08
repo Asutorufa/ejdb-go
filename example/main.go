@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	ejdb "github.com/softmotions/ejdb-go"
+	ejdb "github.com/Asutorufa/ejdb-go"
 )
 
 func main() {
