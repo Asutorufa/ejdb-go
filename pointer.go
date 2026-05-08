@@ -21,6 +21,10 @@ func pointerTokens(ptr string) ([]string, error) {
 	return parts, nil
 }
 
+func pointerEscapeToken(tok string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(tok, "~", "~0"), "/", "~1")
+}
+
 func pointerGet(doc any, ptr string) (any, bool) {
 	tokens, err := pointerTokens(ptr)
 	if err != nil {

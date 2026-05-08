@@ -50,11 +50,12 @@ func indexModeParts(mode IndexMode) (IndexKind, bool, error) {
 }
 
 type Options struct {
-	Path          string
-	AutoSync      bool
-	EnableWAL     bool
-	Engine        StorageEngine
-	PebbleOptions *pebble.Options
+	Path           string
+	AutoSync       bool
+	EnableWAL      bool
+	Engine         StorageEngine
+	PebbleOptions  *pebble.Options
+	SortBufferSize int64
 }
 
 type Document struct {

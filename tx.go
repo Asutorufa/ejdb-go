@@ -147,7 +147,7 @@ func (tx *Tx) Delete(collection string, id int64) error {
 		return ErrNotFound
 	}
 	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
 	tx.db.removeDocFromIndexes(col, id, doc)

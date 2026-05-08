@@ -3,26 +3,30 @@ package ejdb
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
 type DB struct {
-	mu     sync.RWMutex
-	path   string
-	engine StorageEngine
-	state  *dbState
-	closed bool
+	mu             sync.RWMutex
+	path           string
+	engine         StorageEngine
+	state          *dbState
+	closed         bool
+	sortBufferSize int64
 
 	pending   []storageMutation
 	dirtyMeta bool
 	dirtyFull bool
 }
+
+const defaultSortBufferSize = 16 * 1024 * 1024
 
 type storageMutationKind uint8
 
@@ -57,8 +61,12 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	db := &DB{
-		path:   opts.Path,
-		engine: engine,
+		path:           opts.Path,
+		engine:         engine,
+		sortBufferSize: opts.SortBufferSize,
+	}
+	if db.sortBufferSize <= 0 {
+		db.sortBufferSize = defaultSortBufferSize
 	}
 	if err := db.load(); err != nil {
 		_ = engine.Close()
@@ -275,7 +283,7 @@ func (db *DB) Delete(collection string, id int64) error {
 		return ErrNotFound
 	}
 	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
 	db.removeDocFromIndexes(col, id, doc)
@@ -427,9 +435,57 @@ const (
 )
 
 type matchedDoc struct {
-	id   int64
-	raw  json.RawMessage
-	node any
+	id          int64
+	raw         json.RawMessage
+	node        any
+	sortValues  []any
+	spillOffset int64
+	spillSize   int64
+}
+
+type sortSpill struct {
+	file *os.File
+	path string
+	pos  int64
+}
+
+func newSortSpill() (*sortSpill, error) {
+	f, err := os.CreateTemp("", "ejdb-sort-*")
+	if err != nil {
+		return nil, err
+	}
+	return &sortSpill{file: f, path: f.Name()}, nil
+}
+
+func (s *sortSpill) write(raw []byte) (int64, int64, error) {
+	off := s.pos
+	n, err := s.file.Write(raw)
+	if err != nil {
+		return 0, 0, err
+	}
+	if n != len(raw) {
+		return 0, 0, io.ErrShortWrite
+	}
+	s.pos += int64(n)
+	return off, int64(n), nil
+}
+
+func (s *sortSpill) read(off, size int64) ([]byte, error) {
+	buf := make([]byte, size)
+	_, err := s.file.ReadAt(buf, off)
+	return buf, err
+}
+
+func (s *sortSpill) close() {
+	if s == nil {
+		return
+	}
+	if s.file != nil {
+		_ = s.file.Close()
+	}
+	if s.path != "" {
+		_ = os.Remove(s.path)
+	}
 }
 
 func (db *DB) Exec(q *Query, opts *ExecOptions) (int64, error) {
@@ -548,11 +604,28 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			return []Document{}, 0, false, nil
 		}
 	}
+	sortPaths := make([]string, 0, len(pq.sorts))
+	for _, spec := range pq.sorts {
+		path, err := spec.resolve(q)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		sortPaths = append(sortPaths, path)
+	}
 	var candidateIDs []int64
+	var candidate candidatePlan
 	usedIndex := false
+	usedOrderIndex := false
 	if !pq.noidx {
-		if ids, ok := pq.filter.candidate(col, q); ok {
-			candidateIDs = ids
+		if plan, ok := pq.filter.candidate(col, q); ok {
+			candidate = plan
+			candidateIDs = plan.ids
+			usedIndex = true
+		}
+		if plan, ok := chooseOrderByIndexIDs(col, sortPaths, pq.sorts, usedIndex, candidate); ok {
+			candidate = plan
+			candidateIDs = plan.ids
+			usedOrderIndex = true
 			usedIndex = true
 		}
 	}
@@ -565,17 +638,32 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 	}
 	if opts.Log != nil {
 		if usedIndex {
-			_, _ = opts.Log.WriteString("[INDEX] SELECTED\n")
+			if usedOrderIndex {
+				_, _ = opts.Log.WriteString("[INDEX] SELECTED " + indexPlanLog(candidate.index, candidate.explain, true) + "\n")
+			} else {
+				_, _ = opts.Log.WriteString("[INDEX] SELECTED " + indexPlanLog(candidate.index, candidate.explain, false) + "\n")
+			}
+		}
+		if len(sortPaths) > 0 && !usedOrderIndex {
+			_, _ = opts.Log.WriteString("[COLLECTOR] SORTER\n")
 		} else {
 			_, _ = opts.Log.WriteString("[COLLECTOR] PLAIN\n")
 		}
 	}
 
+	willSort := len(sortPaths) > 0 && !usedOrderIndex
+	var spill *sortSpill
+	defer func() {
+		if spill != nil {
+			spill.close()
+		}
+	}()
+	var bufferedSortBytes int64
 	matchedDocs := make([]matchedDoc, 0, len(candidateIDs))
 	for _, id := range candidateIDs {
 		raw := col.Docs[id]
 		var node any
-		if err := json.Unmarshal(raw, &node); err != nil {
+		if err := decodeJSONDocument(raw, &node); err != nil {
 			return nil, 0, false, err
 		}
 		ok, err := pq.filter.match(node, id, q, state)
@@ -583,31 +671,51 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			return nil, 0, false, err
 		}
 		if ok {
-			matchedDocs = append(matchedDocs, matchedDoc{id: id, raw: append(json.RawMessage(nil), raw...), node: node})
+			m := matchedDoc{id: id, raw: append(json.RawMessage(nil), raw...), node: node}
+			if willSort {
+				m.sortValues = make([]any, len(sortPaths))
+				for i, path := range sortPaths {
+					m.sortValues[i], _ = pointerGet(node, path)
+				}
+				bufferedSortBytes += int64(len(m.raw))
+			}
+			matchedDocs = append(matchedDocs, m)
+			if willSort && bufferedSortBytes > db.sortBufferSize {
+				if spill == nil {
+					var err error
+					spill, err = newSortSpill()
+					if err != nil {
+						return nil, 0, false, err
+					}
+				}
+				if err := spillMatchedDocs(spill, matchedDocs); err != nil {
+					return nil, 0, false, err
+				}
+				bufferedSortBytes = 0
+			}
 		}
 	}
 
-	if pq.sort != nil {
-		sortPath, err := pq.sort.path.resolve(q)
-		if err != nil {
-			return nil, 0, false, err
-		}
+	if len(pq.sorts) > 0 && !usedOrderIndex {
 		sort.Slice(matchedDocs, func(i, j int) bool {
 			li := matchedDocs[i]
 			lj := matchedDocs[j]
-			lv, _ := pointerGet(li.node, sortPath)
-			rv, _ := pointerGet(lj.node, sortPath)
-			cmp := genericCmp(lv, rv)
-			if cmp == 0 {
-				if pq.sort.desc {
-					return li.id > lj.id
+			for idx := range sortPaths {
+				lv := li.sortValues[idx]
+				rv := lj.sortValues[idx]
+				cmp := genericCmp(lv, rv)
+				if cmp == 0 {
+					continue
 				}
-				return li.id < lj.id
+				if pq.sorts[idx].desc {
+					return cmp > 0
+				}
+				return cmp < 0
 			}
-			if pq.sort.desc {
-				return cmp > 0
+			if pq.sorts[0].desc {
+				return li.id > lj.id
 			}
-			return cmp < 0
+			return li.id < lj.id
 		})
 	} else {
 		sort.Slice(matchedDocs, func(i, j int) bool { return matchedDocs[i].id < matchedDocs[j].id })
@@ -618,11 +726,17 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		}
 	}
 
-	skip := pq.skip
+	skip, err := resolveIntOption(q, pq.skip, pq.skipPH, "skip")
+	if err != nil {
+		return nil, 0, false, err
+	}
 	if opts.Skip > 0 {
 		skip = int(opts.Skip)
 	}
-	limit := pq.limit
+	limit, err := resolveIntOption(q, pq.limit, pq.limitPH, "limit")
+	if err != nil {
+		return nil, 0, false, err
+	}
 	if opts.Limit > 0 {
 		limit = int(opts.Limit)
 	}
@@ -635,6 +749,14 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		end = start + limit
 	}
 	window := matchedDocs[start:end]
+	if spill != nil {
+		if err := hydrateMatchedDocs(spill, window); err != nil {
+			return nil, 0, false, err
+		}
+		if opts.Log != nil {
+			_, _ = opts.Log.WriteString("[SORTER] OVERFLOW\n")
+		}
+	}
 
 	changed := false
 	affectedCount := int64(0)
@@ -693,6 +815,245 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		return nil, int64(len(docs)), changed, nil
 	}
 	return docs, int64(len(docs)), changed, nil
+}
+
+func chooseOrderByIndexIDs(col *collectionState, sortPaths []string, sorts []querySort, usedFilterIndex bool, filterPlan candidatePlan) (candidatePlan, bool) {
+	if len(sortPaths) != 1 || len(sorts) != 1 {
+		return candidatePlan{}, false
+	}
+	sortPath := sortPaths[0]
+	desc := sorts[0].desc
+	if usedFilterIndex {
+		if filterPlan.index == nil || filterPlan.index.def.Path != sortPath {
+			return candidatePlan{}, false
+		}
+		allowed := make(map[int64]struct{}, len(filterPlan.ids))
+		for _, id := range filterPlan.ids {
+			allowed[id] = struct{}{}
+		}
+		ordered := orderedIDsFromIndex(filterPlan.index, desc)
+		out := make([]int64, 0, len(filterPlan.ids))
+		seen := make(map[int64]struct{}, len(filterPlan.ids))
+		for _, id := range ordered {
+			if _, ok := allowed[id]; !ok {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+		filterPlan.ids = out
+		filterPlan.explain = sortPath
+		return filterPlan, true
+	}
+	rt := findOrderByIndex(col, sortPath)
+	if rt == nil {
+		return candidatePlan{}, false
+	}
+	return candidatePlan{ids: orderedIDsFromIndex(rt, desc), index: rt, weight: 80, explain: sortPath, cursorInit: "IWKV_CURSOR_AFTER_LAST", cursorStep: "IWKV_CURSOR_PREV"}, true
+}
+
+func indexPlanLog(rt *indexRuntime, expr string, orderBy bool) string {
+	if rt == nil {
+		if orderBy {
+			return "ORDERBY"
+		}
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if rt.def.Unique {
+		parts = append(parts, "UNIQUE")
+	}
+	switch rt.def.Kind {
+	case IndexString:
+		parts = append(parts, "STR")
+	case IndexInt64:
+		parts = append(parts, "I64")
+	case IndexFloat:
+		parts = append(parts, "F64")
+	default:
+		parts = append(parts, string(rt.def.Kind))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "INDEX")
+	}
+	out := strings.Join(parts, "|") + " " + rt.def.Path
+	if expr != "" {
+		out += " EXPR1: '" + expr + "'"
+	}
+	if orderBy {
+		out += " ORDERBY"
+	}
+	return out
+}
+
+func findOrderByIndex(col *collectionState, path string) *indexRuntime {
+	keys := make([]string, 0, len(col.runtime))
+	for key, rt := range col.runtime {
+		if rt.def.Path == path {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		li := col.runtime[keys[i]].def
+		lj := col.runtime[keys[j]].def
+		if li.Kind == lj.Kind {
+			if li.Unique == lj.Unique {
+				return keys[i] < keys[j]
+			}
+			return li.Unique && !lj.Unique
+		}
+		return li.Kind < lj.Kind
+	})
+	if len(keys) == 0 {
+		return nil
+	}
+	return col.runtime[keys[0]]
+}
+
+func orderedIDsFromIndex(rt *indexRuntime, desc bool) []int64 {
+	type entry struct {
+		key string
+		ids []int64
+	}
+	entries := make([]entry, 0, len(rt.unique)+len(rt.multi))
+	if rt.def.Unique {
+		for key, id := range rt.unique {
+			entries = append(entries, entry{key: key, ids: []int64{id}})
+		}
+	} else {
+		for key, set := range rt.multi {
+			ids := make([]int64, 0, len(set))
+			for id := range set {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool {
+				if desc {
+					return ids[i] > ids[j]
+				}
+				return ids[i] < ids[j]
+			})
+			entries = append(entries, entry{key: key, ids: ids})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		cmp := compareIndexKeys(rt.def.Kind, entries[i].key, entries[j].key)
+		if cmp == 0 {
+			return entries[i].key < entries[j].key
+		}
+		if desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+	out := make([]int64, 0)
+	seen := make(map[int64]struct{})
+	for _, e := range entries {
+		for _, id := range e.ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func spillMatchedDocs(spill *sortSpill, docs []matchedDoc) error {
+	for i := range docs {
+		if len(docs[i].raw) == 0 || docs[i].spillSize > 0 {
+			continue
+		}
+		off, size, err := spill.write(docs[i].raw)
+		if err != nil {
+			return err
+		}
+		docs[i].spillOffset = off
+		docs[i].spillSize = size
+		docs[i].raw = nil
+		docs[i].node = nil
+	}
+	return nil
+}
+
+func hydrateMatchedDocs(spill *sortSpill, docs []matchedDoc) error {
+	for i := range docs {
+		if len(docs[i].raw) == 0 && docs[i].spillSize > 0 {
+			raw, err := spill.read(docs[i].spillOffset, docs[i].spillSize)
+			if err != nil {
+				return err
+			}
+			docs[i].raw = raw
+		}
+		if docs[i].node == nil && len(docs[i].raw) > 0 {
+			var node any
+			if err := decodeJSONDocument(docs[i].raw, &node); err != nil {
+				return err
+			}
+			docs[i].node = node
+		}
+	}
+	return nil
+}
+
+func compareIndexKeys(kind IndexKind, a, b string) int {
+	switch kind {
+	case IndexInt64:
+		ai, aok := decodeI64IndexKey(a)
+		bi, bok := decodeI64IndexKey(b)
+		if aok && bok {
+			switch {
+			case ai < bi:
+				return -1
+			case ai > bi:
+				return 1
+			default:
+				return 0
+			}
+		}
+	case IndexFloat:
+		af, aok := decodeF64IndexKey(a)
+		bf, bok := decodeF64IndexKey(b)
+		if aok && bok {
+			switch {
+			case af < bf:
+				return -1
+			case af > bf:
+				return 1
+			default:
+				return 0
+			}
+		}
+	}
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func resolveIntOption(q *Query, literal int, ph *placeholderRef, name string) (int, error) {
+	if ph == nil {
+		return literal, nil
+	}
+	v, err := q.resolvePlaceholder(*ph)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := toInt64(v)
+	if !ok || n < 0 {
+		return 0, withCodef(CodeInvalidPlaceholder, "%s placeholder must resolve to a non-negative integer, got %T", name, v)
+	}
+	if n > int64(^uint(0)>>1) {
+		return 0, withCodef(CodeInvalidPlaceholder, "%s placeholder is too large: %d", name, n)
+	}
+	return int(n), nil
 }
 
 func (db *DB) applyActionLocked(state *dbState, col *collectionState, q *Query, window []matchedDoc) (int64, error) {
@@ -767,7 +1128,7 @@ func applyPatchPayload(raw []byte, payload any) ([]byte, error) {
 
 func (db *DB) applyProjectionLocked(state *dbState, q *Query, raw []byte, spec *projectionSpec) ([]byte, error) {
 	var src any
-	if err := json.Unmarshal(raw, &src); err != nil {
+	if err := decodeJSONDocument(raw, &src); err != nil {
 		return nil, err
 	}
 	var out any = map[string]any{}
@@ -824,7 +1185,7 @@ func (db *DB) joinValueLocked(state *dbState, coll string, v any) (any, error) {
 			return nil, nil
 		}
 		var out any
-		if err := json.Unmarshal(raw, &out); err != nil {
+		if err := decodeJSONDocument(raw, &out); err != nil {
 			return nil, err
 		}
 		return out, nil
@@ -868,37 +1229,11 @@ func cloneAny(v any) (any, error) {
 }
 
 func genericCmp(a, b any) int {
-	if a == nil && b == nil {
-		return 0
+	cmp, ok := jqCompare(a, b)
+	if ok {
+		return cmp
 	}
-	if a == nil {
-		return -1
-	}
-	if b == nil {
-		return 1
-	}
-	if an, ok := toFloat64(a); ok {
-		if bn, ok := toFloat64(b); ok {
-			switch {
-			case an < bn:
-				return -1
-			case an > bn:
-				return 1
-			default:
-				return 0
-			}
-		}
-	}
-	as := fmt.Sprint(a)
-	bs := fmt.Sprint(b)
-	switch {
-	case as < bs:
-		return -1
-	case as > bs:
-		return 1
-	default:
-		return 0
-	}
+	return compareKindFallback(a, b)
 }
 
 func (db *DB) ensureCollectionLocked(name string) *collectionState {
@@ -928,7 +1263,7 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 	if old, ok := col.Docs[id]; ok {
 		oldRaw = append(json.RawMessage(nil), old...)
 		var oldDoc any
-		if err := json.Unmarshal(old, &oldDoc); err != nil {
+		if err := decodeJSONDocument(old, &oldDoc); err != nil {
 			return err
 		}
 		db.removeDocFromIndexes(col, id, oldDoc)
@@ -936,7 +1271,7 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 	if err := db.addDocToIndexes(col, id, doc); err != nil {
 		if old, ok := col.Docs[id]; ok {
 			var oldDoc any
-			if err := json.Unmarshal(old, &oldDoc); err == nil {
+			if err := decodeJSONDocument(old, &oldDoc); err == nil {
 				_ = db.addDocToIndexes(col, id, oldDoc)
 			}
 		}
@@ -949,7 +1284,7 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 
 func normalizeRawJSON(raw []byte) (json.RawMessage, any, error) {
 	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return nil, nil, err
 	}
 	canon, err := json.Marshal(doc)
@@ -957,6 +1292,12 @@ func normalizeRawJSON(raw []byte) (json.RawMessage, any, error) {
 		return nil, nil, err
 	}
 	return canon, doc, nil
+}
+
+func decodeJSONDocument(raw []byte, out *any) error {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	return dec.Decode(out)
 }
 
 func (db *DB) rebuildAllIndexes() error {
@@ -980,7 +1321,7 @@ func (db *DB) rebuildIndex(col *collectionState, key string) error {
 	idx.multi = make(map[string]map[int64]struct{})
 	for id, raw := range col.Docs {
 		var doc any
-		if err := json.Unmarshal(raw, &doc); err != nil {
+		if err := decodeJSONDocument(raw, &doc); err != nil {
 			return err
 		}
 		vals := valuesForIndex(doc, idx.def.Path, idx.def.Kind)
@@ -1090,16 +1431,61 @@ func normalizeIndexValue(v any, kind IndexKind) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		return strconv.FormatInt(i, 10), true
+		return encodeI64IndexKey(i), true
 	case IndexFloat:
 		f, ok := toFloat64(v)
 		if !ok {
 			return "", false
 		}
-		return strconv.FormatFloat(f, 'f', -1, 64), true
+		return encodeF64IndexKey(f), true
 	default:
 		return "", false
 	}
+}
+
+func encodeI64IndexKey(v int64) string {
+	return fixedHex64(uint64(v) ^ (uint64(1) << 63))
+}
+
+func decodeI64IndexKey(v string) (int64, bool) {
+	u, err := strconv.ParseUint(v, 16, 64)
+	if err != nil || len(v) != 16 {
+		i, ierr := strconv.ParseInt(v, 10, 64)
+		return i, ierr == nil
+	}
+	return int64(u ^ (uint64(1) << 63)), true
+}
+
+func encodeF64IndexKey(v float64) string {
+	u := math.Float64bits(v)
+	if u&(uint64(1)<<63) != 0 {
+		u = ^u
+	} else {
+		u ^= uint64(1) << 63
+	}
+	return fixedHex64(u)
+}
+
+func decodeF64IndexKey(v string) (float64, bool) {
+	u, err := strconv.ParseUint(v, 16, 64)
+	if err != nil || len(v) != 16 {
+		f, ferr := strconv.ParseFloat(v, 64)
+		return f, ferr == nil
+	}
+	if u&(uint64(1)<<63) != 0 {
+		u ^= uint64(1) << 63
+	} else {
+		u = ^u
+	}
+	return math.Float64frombits(u), true
+}
+
+func fixedHex64(v uint64) string {
+	s := strconv.FormatUint(v, 16)
+	if len(s) >= 16 {
+		return s
+	}
+	return strings.Repeat("0", 16-len(s)) + s
 }
 
 func (db *DB) commitLocked() error {
@@ -1206,7 +1592,7 @@ func (db *DB) deleteIndexKeys(b StorageBatch, collection string, id int64, raw [
 		return nil
 	}
 	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
 	for _, idx := range col.Indexes {
@@ -1229,7 +1615,7 @@ func (db *DB) setIndexKeys(b StorageBatch, collection string, id int64, raw []by
 		return nil
 	}
 	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
 	for _, idx := range col.Indexes {
@@ -1270,7 +1656,7 @@ func (db *DB) persistFullLocked() error {
 				return err
 			}
 			var doc any
-			if err := json.Unmarshal(raw, &doc); err != nil {
+			if err := decodeJSONDocument(raw, &doc); err != nil {
 				return err
 			}
 			for _, idx := range col.Indexes {

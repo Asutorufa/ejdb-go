@@ -19,6 +19,10 @@ const (
 	CodeInvalidPlaceholder ErrorCode = "JQL_INVALID_PLACEHOLDER"
 	CodeUnsetPlaceholder   ErrorCode = "JQL_UNSET_PLACEHOLDER"
 	CodeNoCollection       ErrorCode = "JQL_NO_COLLECTION"
+	CodeSkipAlreadySet     ErrorCode = "JQL_SKIP_ALREADY_SET"
+	CodeLimitAlreadySet    ErrorCode = "JQL_LIMIT_ALREADY_SET"
+	CodeOrderByMaxLimit    ErrorCode = "JQL_ORDERBY_MAX_LIMIT"
+	CodeInvalidValueType   ErrorCode = "JQL_INVALID_VALUE_TYPE"
 )
 
 type Error struct {

@@ -20,6 +20,10 @@ The on-disk format is this project's own Pebble key/value layout:
 - Pluggable `StorageEngine` interface
 - Atomic commits through Pebble batches
 - Pebble checkpoint backups with `Backup(dst)`
+- Official-style order-by planning: a single `ORDERBY` with a matching index scans index order directly; otherwise the query uses a sorter
+- Sort overflow files: sorter input spills to a temporary file after `Options.SortBufferSize` bytes, defaulting to 16 MiB
+- Official-like JQL comparison semantics for null, bool, numbers, strings, arrays, and objects
+- Indexed equality, `in`, range, and string prefix planning
 - Collection management: create, remove, rename
 - Document CRUD: `PutNew`, `Put`, `Get`, `Delete`, `Patch`, `MergeOrPut`
 - Indexes: `IdxUnique | IdxString/IdxInt64/IdxFloat`, including unique constraints and array element expansion
@@ -27,7 +31,9 @@ The on-disk format is this project's own Pebble key/value layout:
   - Filters: `/*`, `/**`, `/path`, `/path/[expr]`, `/=` primary-key matching
   - Expressions: `= != > >= < <= eq/gt/gte/lt/lte in ni re ~ not`
   - Placeholders: named `:name` and positional `:?`
-  - Pipelines: `apply`, `upsert`, `del`, projection, `asc/desc`, `skip/limit/count`
+  - Pipelines: `apply`, `upsert`, `del`, projection, official-style `asc/desc` order-by clauses, `skip/limit/count`
+  - Order by: `asc /firstName desc /age`, `asc /firstName /rank`, and placeholder paths such as `desc :?`
+  - Skip/limit: numeric literals or placeholders, for example `skip :offset limit :limit`
   - Collection joins: `/artist_ref<artists`
 - Execution APIs: `Exec`, `ListQuery`, `Count`, `UpdateQuery`
 - Transactions: `ReadTx`, `WriteTx`
@@ -61,6 +67,14 @@ func main() {
  fmt.Println("hits:", len(res))
 }
 ```
+
+## Options
+
+- `Path`: Pebble database directory.
+- `AutoSync`: use synced Pebble writes when true; the default uses Pebble `NoSync`.
+- `Engine`: optional custom `StorageEngine`.
+- `PebbleOptions`: optional Pebble configuration for the default engine.
+- `SortBufferSize`: sorter in-memory document buffer before temporary-file overflow; default is 16 MiB.
 
 ## Complete Example
 
@@ -105,13 +119,13 @@ Sample environment:
 
 Latest sample:
 
-- `BenchmarkPutNew-10`: `4684 ns/op`, `220617 docs/s`, `220617 ops/s`, `2501 B/op`, `47 allocs/op`
-- `BenchmarkPutNewWriteTx-10`: `1885 ns/op`, `615773 docs/s`, `615773 ops/s`, `2448 B/op`, `37 allocs/op`
-- `BenchmarkGetByID-10`: `33.15 ns/op`, `30812952 docs/s`, `30812952 ops/s`, `31 B/op`, `1 allocs/op`
-- `BenchmarkQueryScanVsIndex/scan-10`: `4356805 ns/op`, `229.5 docs/s`, `229.5 ops/s`, `6327665 B/op`, `120000 allocs/op`
-- `BenchmarkQueryScanVsIndex/indexed-10`: `607.6 ns/op`, `1645749 docs/s`, `1645749 ops/s`, `752 B/op`, `20 allocs/op`
-- `BenchmarkRangeQuery-10`: `4971674 ns/op`, `20513 docs/s`, `205.1 ops/s`, `6501100 B/op`, `130238 allocs/op`
-- `BenchmarkSortPagination-10`: `5078668 ns/op`, `10097 docs/s`, `201.9 ops/s`, `6648008 B/op`, `130040 allocs/op`
-- `BenchmarkUpdateDelete-10`: `17528 ns/op`, `115721 docs/s`, `57860 ops/s`, `12257 B/op`, `232 allocs/op`
+- `BenchmarkPutNew-10`: `4657 ns/op`, `218729 docs/s`, `218729 ops/s`, `4008 B/op`, `54 allocs/op`
+- `BenchmarkPutNewWriteTx-10`: `2006 ns/op`, `568544 docs/s`, `568544 ops/s`, `3779 B/op`, `44 allocs/op`
+- `BenchmarkGetByID-10`: `32.16 ns/op`, `31946468 docs/s`, `31946468 ops/s`, `31 B/op`, `1 allocs/op`
+- `BenchmarkQueryScanVsIndex/scan-10`: `5923565 ns/op`, `168.8 docs/s`, `168.8 ops/s`, `14559789 B/op`, `179747 allocs/op`
+- `BenchmarkQueryScanVsIndex/indexed-10`: `910.2 ns/op`, `1098662 docs/s`, `1098662 ops/s`, `1648 B/op`, `29 allocs/op`
+- `BenchmarkRangeQuery-10`: `14635008 ns/op`, `6965 docs/s`, `69.65 ops/s`, `16328087 B/op`, `209639 allocs/op`
+- `BenchmarkSortPagination-10`: `13562271 ns/op`, `3725 docs/s`, `74.49 ops/s`, `16002939 B/op`, `170147 allocs/op`
+- `BenchmarkUpdateDelete-10`: `17553 ns/op`, `116554 docs/s`, `58277 ops/s`, `18000 B/op`, `270 allocs/op`
 
 Regular document writes, updates, and deletes use incremental Pebble batches. Structural operations such as collection rename, collection removal, and index rebuild still use a full refresh to keep the implementation simple and reliable.

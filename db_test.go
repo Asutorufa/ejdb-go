@@ -3,6 +3,7 @@ package ejdb
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -289,6 +290,241 @@ func TestQueryApplyProjectionJoinExecAndDelete(t *testing.T) {
 	}
 }
 
+func TestOfficialJQLOrderByOptions(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	fixtures := []string{
+		`{"name":"alice-young","firstName":"aa","age":20,"rank":2}`,
+		`{"name":"bob","firstName":"bb","age":40,"rank":1}`,
+		`{"name":"alice-older","firstName":"aa","age":30,"rank":1}`,
+		`{"name":"carol","firstName":"cc","age":25,"rank":3}`,
+	}
+	for _, doc := range fixtures {
+		if _, err := db.PutNew("users", []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	names := func(query string, bindPath string) []string {
+		t.Helper()
+		q := mustQuery(t, "users", query)
+		if bindPath != "" {
+			if err := q.SetString("", 0, bindPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		docs, err := db.ListQuery(q, 0)
+		if err != nil {
+			t.Fatalf("list %q: %v", query, err)
+		}
+		out := make([]string, 0, len(docs))
+		for _, doc := range docs {
+			var m map[string]any
+			if err := json.Unmarshal(doc.Raw, &m); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, m["name"].(string))
+		}
+		return out
+	}
+
+	if got, want := names("/* | asc /firstName desc /age", ""), []string{"alice-older", "alice-young", "bob", "carol"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("multi order got=%v want=%v", got, want)
+	}
+	if got, want := names("/* | asc /firstName desc /age skip 1 limit 2", ""), []string{"alice-young", "bob"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order with skip/limit got=%v want=%v", got, want)
+	}
+	if got, want := names("/* | asc /firstName /rank", ""), []string{"alice-older", "alice-young", "bob", "carol"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shared direction order nodes got=%v want=%v", got, want)
+	}
+	if got, want := names("/* | desc :?", "/age"), []string{"bob", "alice-older", "carol", "alice-young"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("placeholder order got=%v want=%v", got, want)
+	}
+	q := mustQuery(t, "users", "/* | asc /age skip :? limit :?")
+	if err := q.SetI64("", 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.SetI64("", 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	docs, err := db.ListQuery(q, 0)
+	if err != nil {
+		t.Fatalf("placeholder skip/limit: %v", err)
+	}
+	var got []string
+	for _, doc := range docs {
+		var m map[string]any
+		if err := json.Unmarshal(doc.Raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, m["name"].(string))
+	}
+	if want := []string{"carol", "alice-older"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("placeholder skip/limit got=%v want=%v", got, want)
+	}
+
+	if err := db.EnsureIndexMode("users", "/age", IdxInt64); err != nil {
+		t.Fatal(err)
+	}
+	var indexedLog strings.Builder
+	if _, err := db.Exec(mustQuery(t, "users", "/* | asc /age"), &ExecOptions{Log: &indexedLog}); err != nil {
+		t.Fatalf("indexed order exec: %v", err)
+	}
+	if log := indexedLog.String(); !strings.Contains(log, "[INDEX] SELECTED") || !strings.Contains(log, "ORDERBY") || strings.Contains(log, "[COLLECTOR] SORTER") {
+		t.Fatalf("expected index order-by plan without sorter, got log:\n%s", log)
+	}
+	var noidxLog strings.Builder
+	if _, err := db.Exec(mustQuery(t, "users", "/* | asc /age noidx"), &ExecOptions{Log: &noidxLog}); err != nil {
+		t.Fatalf("noidx order exec: %v", err)
+	}
+	if log := noidxLog.String(); !strings.Contains(log, "[COLLECTOR] SORTER") {
+		t.Fatalf("expected sorter with noidx, got log:\n%s", log)
+	}
+}
+
+func TestOfficialJQLSorterOverflow(t *testing.T) {
+	db, err := Open(Options{Path: filepath.Join(t.TempDir(), "db.pebble"), SortBufferSize: 1024})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	payload := strings.Repeat("x", 2048)
+	fixtures := []string{
+		`{"name":"third","rank":3,"payload":"` + payload + `"}`,
+		`{"name":"first","rank":1,"payload":"` + payload + `"}`,
+		`{"name":"second","rank":2,"payload":"` + payload + `"}`,
+	}
+	for _, doc := range fixtures {
+		if _, err := db.PutNew("docs", []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	docs, err := db.ListQuery(mustQuery(t, "docs", "/* | asc /rank"), 0)
+	if err != nil {
+		t.Fatalf("list with overflow sorter: %v", err)
+	}
+	var got []string
+	for _, doc := range docs {
+		var m map[string]any
+		if err := json.Unmarshal(doc.Raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, m["name"].(string))
+	}
+	if want := []string{"first", "second", "third"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overflow sorter got=%v want=%v", got, want)
+	}
+
+	var log strings.Builder
+	if _, err := db.Exec(mustQuery(t, "docs", "/* | asc /rank"), &ExecOptions{Log: &log}); err != nil {
+		t.Fatalf("exec with overflow sorter: %v", err)
+	}
+	if !strings.Contains(log.String(), "[SORTER] OVERFLOW") {
+		t.Fatalf("expected overflow sorter log, got:\n%s", log.String())
+	}
+}
+
+func TestOfficialPlannerRangePrefixAndComparison(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.EnsureIndexMode("nums", "/v", IdxInt64); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int{-2, -1, 0, 1, 2} {
+		doc := []byte(fmt.Sprintf(`{"v":%d}`, v))
+		if _, err := db.PutNew("nums", doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rangeLog strings.Builder
+	docs, err := db.ListQuery(mustQuery(t, "nums", "/[v >= -1 and v < 2] | asc /v"), 0)
+	if err != nil {
+		t.Fatalf("range list: %v", err)
+	}
+	if _, err := db.Exec(mustQuery(t, "nums", "/[v >= -1 and v < 2] | asc /v"), &ExecOptions{Log: &rangeLog}); err != nil {
+		t.Fatalf("range explain: %v", err)
+	}
+	if log := rangeLog.String(); !strings.Contains(log, "[INDEX] SELECTED") || strings.Contains(log, "[COLLECTOR] SORTER") {
+		t.Fatalf("expected indexed range/order plan, got:\n%s", log)
+	}
+	var nums []int
+	for _, doc := range docs {
+		var m map[string]any
+		if err := json.Unmarshal(doc.Raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		nums = append(nums, int(m["v"].(float64)))
+	}
+	if want := []int{-1, 0, 1}; !reflect.DeepEqual(nums, want) {
+		t.Fatalf("range docs got=%v want=%v", nums, want)
+	}
+
+	if err := db.EnsureIndexMode("names", "/lastName", IdxString); err != nil {
+		t.Fatal(err)
+	}
+	for _, doc := range []string{
+		`{"lastName":"Doe"}`,
+		`{"lastName":"Doll"}`,
+		`{"lastName":"Smith"}`,
+	} {
+		if _, err := db.PutNew("names", []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var prefixLog strings.Builder
+	prefixDocs, err := db.ListQuery(mustQuery(t, "names", "/[lastName ~ 'Do'] | asc /lastName"), 0)
+	if err != nil {
+		t.Fatalf("prefix list: %v", err)
+	}
+	if _, err := db.Exec(mustQuery(t, "names", "/[lastName ~ 'Do'] | asc /lastName"), &ExecOptions{Log: &prefixLog}); err != nil {
+		t.Fatalf("prefix explain: %v", err)
+	}
+	if log := prefixLog.String(); !strings.Contains(log, "[INDEX] SELECTED") {
+		t.Fatalf("expected indexed prefix plan, got:\n%s", log)
+	}
+	if len(prefixDocs) != 2 {
+		t.Fatalf("expected two prefix docs, got %d", len(prefixDocs))
+	}
+
+	for _, doc := range []string{
+		`{"s":"bbb"}`,
+		`{"s":"aa"}`,
+		`{"s":"c"}`,
+	} {
+		if _, err := db.PutNew("strings", []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sdocs, err := db.ListQuery(mustQuery(t, "strings", "/* | asc /s"), 0)
+	if err != nil {
+		t.Fatalf("string order list: %v", err)
+	}
+	var got []string
+	for _, doc := range sdocs {
+		var m map[string]any
+		if err := json.Unmarshal(doc.Raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, m["s"].(string))
+	}
+	if want := []string{"c", "aa", "bbb"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("official string order got=%v want=%v", got, want)
+	}
+}
+
+func TestOfficialJQLParserErrors(t *testing.T) {
+	if _, err := NewQuery("c", "/* | skip 1 skip 2"); !errors.Is(err, &Error{Code: CodeSkipAlreadySet}) {
+		t.Fatalf("expected duplicate skip error, got %v", err)
+	}
+	if _, err := NewQuery("c", "/* | limit 1 limit 2"); !errors.Is(err, &Error{Code: CodeLimitAlreadySet}) {
+		t.Fatalf("expected duplicate limit error, got %v", err)
+	}
+}
+
 func TestOfficialJQLCoreMatchingCases(t *testing.T) {
 	assertJQLMatch(t, "{}", "/*", true)
 	assertJQLMatch(t, "{}", "/**", true)
@@ -312,4 +548,7 @@ func TestOfficialJQLCoreMatchingCases(t *testing.T) {
 	assertJQLMatch(t, "{'foo':{'obj':{'f':'d','e':'j'}}}", "/foo/[obj = {\"e\":\"j\",\"f\":\"d\"}]", true)
 	assertJQLMatch(t, "{'f':22}", "/=22", true)
 	assertJQLMatch(t, "{'f':22}", "@mycoll/=22", true)
+	assertJQLMatch(t, "{'lastName':'Doe'}", "/[lastName ~ 'Do']", true)
+	assertJQLMatch(t, "{'lastName':'Smith'}", "/[lastName ~ 'Do']", false)
+	assertJQLMatch(t, "{'foo bar':22}", `/"foo bar"`, true)
 }
