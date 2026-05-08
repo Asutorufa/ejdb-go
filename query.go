@@ -9,11 +9,13 @@ import (
 )
 
 type Query struct {
-	collection string
-	text       string
-	parsed     parsedQuery
-	named      map[string]any
-	positional map[int]any
+	collection     string
+	text           string
+	parsed         parsedQuery
+	named          map[string]any
+	positional     map[int]any
+	pathNamed      map[string]struct{}
+	pathPositional map[int]struct{}
 }
 
 func (db *DB) CreateQuery(collection, text string) (*Query, error) {
@@ -32,6 +34,7 @@ func NewQuery(collection, text string) (*Query, error) {
 		named:      make(map[string]any),
 		positional: make(map[int]any),
 	}
+	q.pathNamed, q.pathPositional = pathPlaceholderSets(pq.pathPlaceholders)
 	if pq.collection != "" {
 		q.collection = pq.collection
 	}
@@ -51,11 +54,21 @@ func (q *Query) Text() string {
 
 func (q *Query) SetJSON(name string, index int, val any) error {
 	if name != "" {
+		if _, ok := q.pathNamed[name]; ok {
+			if _, ok := val.(string); !ok {
+				return withCodef(CodeInvalidPlaceholder, "path placeholder :%s must be a string, got %T", name, val)
+			}
+		}
 		q.named[name] = val
 		return nil
 	}
 	if index < 0 {
 		return withCodef(CodeInvalidPlaceholder, "negative positional placeholder index: %d", index)
+	}
+	if _, ok := q.pathPositional[index]; ok {
+		if _, ok := val.(string); !ok {
+			return withCodef(CodeInvalidPlaceholder, "path placeholder :? at index %d must be a string, got %T", index, val)
+		}
 	}
 	q.positional[index] = val
 	return nil
@@ -134,21 +147,22 @@ const (
 )
 
 type parsedQuery struct {
-	collection string
-	filter     filterNode
-	action     queryAction
-	actionArg  valueExpr
-	projection *projectionSpec
-	sorts      []querySort
-	skip       int
-	skipPH     *placeholderRef
-	skipSet    bool
-	limit      int
-	limitPH    *placeholderRef
-	limitSet   bool
-	count      bool
-	noidx      bool
-	inverse    bool
+	collection       string
+	filter           filterNode
+	action           queryAction
+	actionArg        valueExpr
+	projection       *projectionSpec
+	sorts            []querySort
+	skip             int
+	skipPH           *placeholderRef
+	skipSet          bool
+	limit            int
+	limitPH          *placeholderRef
+	limitSet         bool
+	count            bool
+	noidx            bool
+	inverse          bool
+	pathPlaceholders []placeholderRef
 }
 
 type querySort struct {
@@ -186,10 +200,15 @@ type candidatePlan struct {
 	idx        indexState
 	op         string
 	value      any
+	op2        string
+	value2     any
 	weight     int
 	explain    string
+	explain2   string
 	cursorInit string
 	cursorStep string
+	rnum       int
+	pathCnt    int
 }
 
 func betterCandidate(a candidatePlan, aok bool, b candidatePlan, bok bool) (candidatePlan, bool) {
@@ -200,6 +219,12 @@ func betterCandidate(a candidatePlan, aok bool, b candidatePlan, bok bool) (cand
 		return a, aok
 	case b.weight > a.weight:
 		return b, true
+	case b.weight == a.weight && (b.op2 != "") != (a.op2 != ""):
+		return b, b.op2 != ""
+	case b.weight == a.weight && b.rnum != a.rnum:
+		return b, b.rnum < a.rnum
+	case b.weight == a.weight && b.pathCnt != a.pathCnt:
+		return b, b.pathCnt < a.pathCnt
 	case b.weight == a.weight && b.index != nil && a.index != nil && b.index.def.Unique && !a.index.def.Unique:
 		return b, true
 	default:
@@ -235,7 +260,49 @@ func (f filterAnd) match(doc any, id int64, q *Query, st *dbState) (bool, error)
 func (f filterAnd) candidate(col *collectionState, q *Query) (candidatePlan, bool) {
 	lp, lok := f.left.candidate(col, q)
 	rp, rok := f.right.candidate(col, q)
+	if merged, ok := mergeRangeCandidates(lp, lok, rp, rok); ok {
+		return merged, true
+	}
 	return betterCandidate(lp, lok, rp, rok)
+}
+
+func mergeRangeCandidates(a candidatePlan, aok bool, b candidatePlan, bok bool) (candidatePlan, bool) {
+	if !aok || !bok || a.index == nil || b.index == nil {
+		return candidatePlan{}, false
+	}
+	if a.idx.Path != b.idx.Path || a.idx.Kind != b.idx.Kind || a.idx.Unique != b.idx.Unique {
+		return candidatePlan{}, false
+	}
+	if !isLowerBoundOp(a.op) && !isUpperBoundOp(a.op) {
+		return candidatePlan{}, false
+	}
+	if !isLowerBoundOp(b.op) && !isUpperBoundOp(b.op) {
+		return candidatePlan{}, false
+	}
+	if (isLowerBoundOp(a.op) && isLowerBoundOp(b.op)) || (isUpperBoundOp(a.op) && isUpperBoundOp(b.op)) {
+		return candidatePlan{}, false
+	}
+	out := a
+	if isUpperBoundOp(a.op) {
+		out = b
+		out.op2 = a.op
+		out.value2 = a.value
+		out.explain2 = a.explain
+	} else {
+		out.op2 = b.op
+		out.value2 = b.value
+		out.explain2 = b.explain
+	}
+	out.weight = 75
+	return out, true
+}
+
+func isLowerBoundOp(op string) bool {
+	return op == ">" || op == ">="
+}
+
+func isUpperBoundOp(op string) bool {
+	return op == "<" || op == "<="
 }
 
 type filterOr struct {
@@ -274,11 +341,32 @@ func (f filterNot) candidate(col *collectionState, q *Query) (candidatePlan, boo
 	return candidatePlan{}, false
 }
 
+type filterGroup struct {
+	node filterNode
+}
+
+func (f filterGroup) match(doc any, id int64, q *Query, st *dbState) (bool, error) {
+	return f.node.match(doc, id, q, st)
+}
+
+func (f filterGroup) candidate(col *collectionState, q *Query) (candidatePlan, bool) {
+	return f.node.candidate(col, q)
+}
+
 type queryFilter struct {
+	anchor      string
 	all         bool
+	allPath     string
 	pk          *valueExpr
 	pathPattern string
 	expr        exprNode
+	chain       []filterStep
+}
+
+type filterStep struct {
+	kind string
+	key  string
+	expr exprNode
 }
 
 func (f queryFilter) match(doc any, id int64, q *Query, st *dbState) (bool, error) {
@@ -301,6 +389,10 @@ func (f queryFilter) match(doc any, id int64, q *Query, st *dbState) (bool, erro
 		}
 		return false, nil
 	}
+	if len(f.chain) > 0 {
+		nodes, err := matchFilterChain([]any{doc}, f.chain, q)
+		return len(nodes) > 0, err
+	}
 	nodes := findNodesByPattern(doc, f.pathPattern)
 	if f.expr == nil {
 		return len(nodes) > 0, nil
@@ -318,24 +410,46 @@ func (f queryFilter) match(doc any, id int64, q *Query, st *dbState) (bool, erro
 }
 
 func (f queryFilter) candidate(col *collectionState, q *Query) (candidatePlan, bool) {
-	cmp, ok := f.expr.(exprCmp)
-	if !ok {
+	if len(f.chain) > 0 {
 		return candidatePlan{}, false
 	}
 	if strings.Contains(f.pathPattern, "*") {
 		return candidatePlan{}, false
 	}
-	if !isIndexableOp(cmp.cmp.op) {
+	return candidateFromExpr(col, q, f.pathPattern, f.expr)
+}
+
+func candidateFromExpr(col *collectionState, q *Query, pathPattern string, expr exprNode) (candidatePlan, bool) {
+	switch e := expr.(type) {
+	case exprCmp:
+		return candidateFromComparison(col, q, pathPattern, e.cmp)
+	case exprAnd:
+		lp, lok := candidateFromExpr(col, q, pathPattern, e.left)
+		rp, rok := candidateFromExpr(col, q, pathPattern, e.right)
+		if merged, ok := mergeRangeCandidates(lp, lok, rp, rok); ok {
+			return merged, true
+		}
+		return betterCandidate(lp, lok, rp, rok)
+	default:
 		return candidatePlan{}, false
 	}
-	if cmp.cmp.key != "*" && cmp.cmp.key != "**" && strings.Contains(cmp.cmp.key, "/") {
+}
+
+func candidateFromComparison(col *collectionState, q *Query, pathPattern string, cmp comparison) (candidatePlan, bool) {
+	if !isIndexableOp(cmp.op) {
 		return candidatePlan{}, false
 	}
-	if cmp.cmp.key == "*" || cmp.cmp.key == "**" {
+	if cmp.key != "*" && cmp.key != "**" && strings.Contains(cmp.key, "/") {
 		return candidatePlan{}, false
 	}
-	path := pointerJoin(f.pathPattern, cmp.cmp.key)
-	val, err := cmp.cmp.value.resolve(q)
+	if cmp.key == "*" {
+		return candidatePlan{}, false
+	}
+	path := pathPattern
+	if cmp.key != "**" {
+		path = pointerJoin(pathPattern, cmp.key)
+	}
+	val, err := cmp.value.resolve(q)
 	if err != nil {
 		return candidatePlan{}, false
 	}
@@ -345,20 +459,22 @@ func (f queryFilter) candidate(col *collectionState, q *Query) (candidatePlan, b
 		if rt.def.Path != path {
 			continue
 		}
-		weight, cursorInit, cursorStep, ok := indexOpPlan(rt.def, cmp.cmp.op, val)
+		weight, cursorInit, cursorStep, ok := indexOpPlan(rt.def, cmp.op, val, len(col.Docs))
 		if !ok {
 			continue
 		}
 		plan := candidatePlan{
 			index:      rt,
 			idx:        rt.def,
-			op:         cmp.cmp.op,
+			op:         cmp.op,
 			value:      val,
 			weight:     weight,
 			cursorInit: cursorInit,
 			cursorStep: cursorStep,
+			rnum:       len(col.Docs),
+			pathCnt:    indexPathTokenCount(rt.def.Path),
 		}
-		plan.explain = fmt.Sprintf("%s %s %v", path, cmp.cmp.op, val)
+		plan.explain = fmt.Sprintf("%s %s %v", path, cmp.op, val)
 		best, bestOK = betterCandidate(best, bestOK, plan, true)
 	}
 	return best, bestOK
@@ -373,7 +489,7 @@ func isIndexableOp(op string) bool {
 	}
 }
 
-func indexOpPlan(idx indexState, op string, val any) (weight int, cursorInit string, cursorStep string, ok bool) {
+func indexOpPlan(idx indexState, op string, val any, rnum int) (weight int, cursorInit string, cursorStep string, ok bool) {
 	switch op {
 	case "=":
 		if _, ok := normalizeIndexValue(val, idx.Kind); !ok {
@@ -383,6 +499,9 @@ func indexOpPlan(idx indexState, op string, val any) (weight int, cursorInit str
 	case "in":
 		arr, ok := toAnySlice(val)
 		if !ok {
+			return 0, "", "", false
+		}
+		if len(arr) > 10 && (len(arr) > 500 || rnum < len(arr)*200) {
 			return 0, "", "", false
 		}
 		for _, it := range arr {
@@ -411,6 +530,14 @@ func indexOpPlan(idx indexState, op string, val any) (weight int, cursorInit str
 	default:
 		return 0, "", "", false
 	}
+}
+
+func indexPathTokenCount(path string) int {
+	toks, err := pointerTokens(path)
+	if err != nil {
+		return 0
+	}
+	return len(toks)
 }
 
 type exprNode interface {
@@ -464,6 +591,14 @@ func (e exprNot) eval(base any, q *Query) (bool, error) {
 		return false, err
 	}
 	return !m, nil
+}
+
+type exprGroup struct {
+	node exprNode
+}
+
+func (e exprGroup) eval(base any, q *Query) (bool, error) {
+	return e.node.eval(base, q)
 }
 
 type comparison struct {
@@ -524,7 +659,14 @@ func (p pathTemplate) resolve(q *Query) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		tokens = append(tokens, pointerEscapeToken(fmt.Sprint(v)))
+		s, ok := v.(string)
+		if !ok {
+			if part.ph.positional {
+				return "", withCodef(CodeInvalidPlaceholder, "path placeholder :? at index %d must resolve to a string, got %T", part.ph.index, v)
+			}
+			return "", withCodef(CodeInvalidPlaceholder, "path placeholder :%s must resolve to a string, got %T", part.ph.name, v)
+		}
+		tokens = append(tokens, pointerEscapeToken(s))
 	}
 	return "/" + strings.Join(tokens, "/"), nil
 }
@@ -581,7 +723,21 @@ func parseQuery(q string) (parsedQuery, error) {
 			}
 		}
 	}
+	out.pathPlaceholders = append([]placeholderRef(nil), ctx.pathPlaceholders...)
 	return out, nil
+}
+
+func pathPlaceholderSets(refs []placeholderRef) (map[string]struct{}, map[int]struct{}) {
+	named := make(map[string]struct{})
+	positional := make(map[int]struct{})
+	for _, ph := range refs {
+		if ph.positional {
+			positional[ph.index] = struct{}{}
+		} else {
+			named[ph.name] = struct{}{}
+		}
+	}
+	return named, positional
 }
 
 const maxOrderByClauses = 64
@@ -690,6 +846,7 @@ func parseOrderByToken(tok string, desc bool, ctx *parseContext) (querySort, err
 		if err != nil {
 			return querySort{}, err
 		}
+		ctx.pathPlaceholders = append(ctx.pathPlaceholders, ph)
 		return querySort{desc: desc, placeholder: &ph}, nil
 	}
 	pt, err := parsePathTemplate(tok, ctx)
@@ -743,22 +900,32 @@ func splitOptionTokens(in string) ([]string, error) {
 
 type parseContext struct {
 	positionalCounter int
+	pathPlaceholders  []placeholderRef
 }
 
 func splitPipeline(in string) ([]string, error) {
 	parts := make([]string, 0, 4)
 	var b strings.Builder
 	quote := rune(0)
+	escaped := false
 	dSquare := 0
 	dCurly := 0
 	dParen := 0
 	for _, r := range in {
 		switch {
 		case quote != 0:
+			b.WriteRune(r)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
 			if r == quote {
 				quote = 0
 			}
-			b.WriteRune(r)
 		case r == '\'' || r == '"':
 			quote = r
 			b.WriteRune(r)
@@ -821,6 +988,7 @@ func tokenizeLogical(in string) ([]token, error) {
 	var b strings.Builder
 	runes := []rune(strings.TrimSpace(in))
 	quote := rune(0)
+	escaped := false
 	dSquare := 0
 	dCurly := 0
 	flushAtom := func() {
@@ -834,10 +1002,18 @@ func tokenizeLogical(in string) ([]token, error) {
 		r := runes[i]
 		switch {
 		case quote != 0:
+			b.WriteRune(r)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
 			if r == quote {
 				quote = 0
 			}
-			b.WriteRune(r)
 		case r == '\'' || r == '"':
 			quote = r
 			b.WriteRune(r)
@@ -1037,7 +1213,7 @@ func parseFilterPrimary(ts *tokenStream, ctx *parseContext) (filterNode, string,
 		if !ok || rp.kind != tkRParen {
 			return nil, "", withCode(CodeInvalidQuery, "missing closing parenthesis in filter")
 		}
-		return node, coll, nil
+		return filterGroup{node: node}, coll, nil
 	case tkAtom:
 		f, coll, err := parseFilterAtom(t.text, ctx)
 		if err != nil {
@@ -1061,14 +1237,21 @@ func parseFilterAtom(spec string, ctx *parseContext) (queryFilter, string, error
 		spec = spec[slash:]
 	}
 	if spec == "/*" || spec == "/**" {
-		return queryFilter{all: true}, coll, nil
+		return queryFilter{anchor: coll, all: true, allPath: spec}, coll, nil
 	}
 	if strings.HasPrefix(spec, "/=") {
 		v, err := parseValueExpr(strings.TrimSpace(strings.TrimPrefix(spec, "/=")), ctx)
 		if err != nil {
 			return queryFilter{}, "", err
 		}
-		return queryFilter{pk: &v}, coll, nil
+		return queryFilter{anchor: coll, pk: &v}, coll, nil
+	}
+	chainCtx := *ctx
+	if chain, ok, err := parseFilterChain(spec, &chainCtx); err != nil {
+		return queryFilter{}, "", err
+	} else if ok && isComplexFilterChain(chain) {
+		*ctx = chainCtx
+		return queryFilter{anchor: coll, chain: chain}, coll, nil
 	}
 	if strings.Contains(spec, "/[") {
 		idx := strings.Index(spec, "/[")
@@ -1089,7 +1272,7 @@ func parseFilterAtom(spec string, ctx *parseContext) (queryFilter, string, error
 		if err != nil {
 			return queryFilter{}, "", err
 		}
-		return queryFilter{pathPattern: base, expr: expr}, coll, nil
+		return queryFilter{anchor: coll, pathPattern: base, expr: expr}, coll, nil
 	}
 	if !strings.HasPrefix(spec, "/") {
 		return queryFilter{}, "", withCodef(CodeInvalidQuery, "filter must start with '/': %s", spec)
@@ -1098,7 +1281,124 @@ func parseFilterAtom(spec string, ctx *parseContext) (queryFilter, string, error
 	if err != nil {
 		return queryFilter{}, "", err
 	}
-	return queryFilter{pathPattern: path}, coll, nil
+	return queryFilter{anchor: coll, pathPattern: path}, coll, nil
+}
+
+func isComplexFilterChain(chain []filterStep) bool {
+	exprCount := 0
+	for i, st := range chain {
+		if st.kind == "expr" {
+			exprCount++
+			if i != len(chain)-1 || exprCount > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func parseFilterChain(spec string, ctx *parseContext) ([]filterStep, bool, error) {
+	if !strings.HasPrefix(spec, "/") {
+		return nil, false, nil
+	}
+	steps := make([]filterStep, 0, 4)
+	for i := 1; i < len(spec); {
+		if spec[i] == '/' {
+			i++
+			continue
+		}
+		if spec[i] == '[' {
+			end, err := findBalancedEnd(spec, i, '[', ']')
+			if err != nil {
+				return nil, false, err
+			}
+			expr, err := parseExpr(strings.TrimSpace(spec[i+1:end]), ctx)
+			if err != nil {
+				return nil, false, err
+			}
+			steps = append(steps, filterStep{kind: "expr", expr: expr})
+			i = end + 1
+			continue
+		}
+		start := i
+		quote := byte(0)
+		escaped := false
+		for i < len(spec) {
+			c := spec[i]
+			if quote != 0 {
+				if escaped {
+					escaped = false
+				} else if c == '\\' {
+					escaped = true
+				} else if c == quote {
+					quote = 0
+				}
+				i++
+				continue
+			}
+			if c == '\'' || c == '"' {
+				quote = c
+				i++
+				continue
+			}
+			if c == '\\' {
+				i += 2
+				continue
+			}
+			if c == '/' {
+				break
+			}
+			i++
+		}
+		raw := spec[start:i]
+		key, err := normalizeJQLPathToken(raw)
+		if err != nil {
+			return nil, false, err
+		}
+		switch key {
+		case "*":
+			steps = append(steps, filterStep{kind: "any"})
+		case "**":
+			steps = append(steps, filterStep{kind: "desc"})
+		default:
+			steps = append(steps, filterStep{kind: "field", key: key})
+		}
+	}
+	return steps, true, nil
+}
+
+func findBalancedEnd(s string, start int, open, close byte) (int, error) {
+	depth := 0
+	quote := byte(0)
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			continue
+		}
+		if c == open {
+			depth++
+			continue
+		}
+		if c == close {
+			depth--
+			if depth == 0 {
+				return i, nil
+			}
+		}
+	}
+	return -1, withCode(CodeInvalidQuery, "unbalanced filter node expression")
 }
 
 func parseExpr(in string, ctx *parseContext) (exprNode, error) {
@@ -1185,7 +1485,7 @@ func parseExprPrimary(ts *tokenStream, ctx *parseContext) (exprNode, error) {
 		if !ok || rp.kind != tkRParen {
 			return nil, withCode(CodeInvalidQuery, "missing closing parenthesis")
 		}
-		return n, nil
+		return exprGroup{node: n}, nil
 	case tkAtom:
 		cmp, err := parseComparison(t.text, ctx)
 		if err != nil {
@@ -1201,6 +1501,17 @@ func parseComparison(s string, ctx *parseContext) (comparison, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return comparison{}, withCode(CodeInvalidQuery, "empty comparison")
+	}
+	if idx, end, norm, ok := findBangNegatedOperator(s); ok {
+		left := strings.TrimSpace(s[:idx])
+		right := strings.TrimSpace(s[end:])
+		if left != "" && right != "" {
+			v, err := parseValueExpr(right, ctx)
+			if err != nil {
+				return comparison{}, err
+			}
+			return comparison{key: left, op: norm, value: v}, nil
+		}
 	}
 	for _, item := range []struct {
 		op      string
@@ -1227,7 +1538,7 @@ func parseComparison(s string, ctx *parseContext) (comparison, error) {
 		}
 	}
 	for _, op := range []string{"!eq", "gte", "lte", "gt", "lt", ">=", "<=", "!=", "=", ">", "<", "eq"} {
-		if idx := strings.Index(s, op); idx >= 0 {
+		if idx := findTopLevelOperator(s, op); idx >= 0 {
 			left := strings.TrimSpace(s[:idx])
 			right := strings.TrimSpace(s[idx+len(op):])
 			if left == "" || right == "" {
@@ -1256,6 +1567,140 @@ func parseComparison(s string, ctx *parseContext) (comparison, error) {
 		}
 	}
 	return comparison{}, withCodef(CodeInvalidQuery, "malformed comparison: %s", s)
+}
+
+func findBangNegatedOperator(s string) (idx int, end int, norm string, ok bool) {
+	runes := []rune(s)
+	quote := rune(0)
+	depthSquare := 0
+	depthCurly := 0
+	for i, r := range runes {
+		switch {
+		case quote != 0:
+			if r == '\\' {
+				i++
+				continue
+			}
+			if r == quote {
+				quote = 0
+			}
+			continue
+		case r == '\'' || r == '"':
+			quote = r
+			continue
+		case r == '[':
+			depthSquare++
+			continue
+		case r == ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+			continue
+		case r == '{':
+			depthCurly++
+			continue
+		case r == '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+			continue
+		}
+		if depthSquare != 0 || depthCurly != 0 || r != '!' {
+			continue
+		}
+		j := i + 1
+		for j < len(runes) && (runes[j] == ' ' || runes[j] == '\t' || runes[j] == '\n' || runes[j] == '\r') {
+			j++
+		}
+		switch {
+		case j < len(runes) && runes[j] == '=':
+			return len(string(runes[:i])), len(string(runes[:j+1])), "!=", true
+		case j < len(runes) && runes[j] == '~':
+			return len(string(runes[:i])), len(string(runes[:j+1])), "nprefix", true
+		case j+2 <= len(runes) && string(runes[j:j+2]) == "eq" && wordOpBoundary(runes, j, j+2):
+			return len(string(runes[:i])), len(string(runes[:j+2])), "!=", true
+		}
+	}
+	return 0, 0, "", false
+}
+
+func findTopLevelOperator(s, op string) int {
+	runes := []rune(s)
+	target := []rune(op)
+	quote := rune(0)
+	depthSquare := 0
+	depthCurly := 0
+	for i := 0; i+len(target) <= len(runes); i++ {
+		r := runes[i]
+		switch {
+		case quote != 0:
+			if r == '\\' {
+				i++
+				continue
+			}
+			if r == quote {
+				quote = 0
+			}
+			continue
+		case r == '\'' || r == '"':
+			quote = r
+			continue
+		case r == '[':
+			depthSquare++
+			continue
+		case r == ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+			continue
+		case r == '{':
+			depthCurly++
+			continue
+		case r == '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+			continue
+		}
+		if depthSquare != 0 || depthCurly != 0 {
+			continue
+		}
+		matched := true
+		for j := range target {
+			if runes[i+j] != target[j] {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if isAlphaOp(op) && !wordOpBoundary(runes, i, i+len(target)) {
+			continue
+		}
+		return len(string(runes[:i]))
+	}
+	return -1
+}
+
+func isAlphaOp(op string) bool {
+	for _, r := range op {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '!' {
+			return false
+		}
+	}
+	return true
+}
+
+func wordOpBoundary(runes []rune, start, end int) bool {
+	if start > 0 && isIdentRune(runes[start-1]) {
+		return false
+	}
+	return end >= len(runes) || !isIdentRune(runes[end])
+}
+
+func isIdentRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
 }
 
 func parseValueExpr(s string, ctx *parseContext) (valueExpr, error) {
@@ -1485,6 +1930,7 @@ func parsePathTemplate(path string, ctx *parseContext) (pathTemplate, error) {
 			if err != nil {
 				return pathTemplate{}, err
 			}
+			ctx.pathPlaceholders = append(ctx.pathPlaceholders, ph)
 			parts = append(parts, pathPart{ph: &ph})
 			continue
 		}
@@ -1531,43 +1977,63 @@ func parseJQLPathTokens(path string) ([]string, error) {
 	tokens := make([]string, 0, 4)
 	var b strings.Builder
 	escaped := false
+	quote := rune(0)
 	runes := []rune(path[1:])
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		if escaped {
-			switch r {
-			case '\\', '/', '{', '}', ',', ' ', '\t', '\n', '\r':
+			if quote == '"' {
+				b.WriteRune('\\')
 				b.WriteRune(r)
-			case 'b':
-				b.WriteByte('\b')
-			case 'f':
-				b.WriteByte('\f')
-			case 'n':
-				b.WriteByte('\n')
-			case 'r':
-				b.WriteByte('\r')
-			case 't':
-				b.WriteByte('\t')
-			case 'u':
-				if i+4 >= len(runes) {
-					return nil, fmt.Errorf("short unicode path escape")
+			} else {
+				switch r {
+				case '\\', '/', '{', '}', ',', ' ', '\t', '\n', '\r', '"', '\'':
+					b.WriteRune(r)
+				case 'b':
+					b.WriteByte('\b')
+				case 'f':
+					b.WriteByte('\f')
+				case 'n':
+					b.WriteByte('\n')
+				case 'r':
+					b.WriteByte('\r')
+				case 't':
+					b.WriteByte('\t')
+				case 'u':
+					if i+4 >= len(runes) {
+						return nil, fmt.Errorf("short unicode path escape")
+					}
+					hex := string(runes[i+1 : i+5])
+					u, err := strconv.ParseInt(hex, 16, 32)
+					if err != nil {
+						return nil, fmt.Errorf("invalid unicode path escape: %s", hex)
+					}
+					b.WriteRune(rune(u))
+					i += 4
+				default:
+					b.WriteRune(r)
 				}
-				hex := string(runes[i+1 : i+5])
-				u, err := strconv.ParseInt(hex, 16, 32)
-				if err != nil {
-					return nil, fmt.Errorf("invalid unicode path escape: %s", hex)
-				}
-				b.WriteRune(rune(u))
-				i += 4
-			default:
-				b.WriteRune(r)
 			}
 			escaped = false
+			continue
+		}
+		if quote != 0 {
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			b.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
 			continue
 		}
 		switch r {
 		case '\\':
 			escaped = true
+		case '\'', '"':
+			quote = r
+			b.WriteRune(r)
 		case '/':
 			tokens = append(tokens, b.String())
 			b.Reset()
@@ -1578,8 +2044,41 @@ func parseJQLPathTokens(path string) ([]string, error) {
 	if escaped {
 		return nil, fmt.Errorf("unterminated path escape")
 	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quoted path token")
+	}
 	tokens = append(tokens, b.String())
 	return tokens, nil
+}
+
+func decodePathEscape(runes []rune, i *int, r rune) (rune, bool, error) {
+	switch r {
+	case '\\', '/', '{', '}', ',', ' ', '\t', '\n', '\r', '"', '\'':
+		return r, false, nil
+	case 'b':
+		return '\b', false, nil
+	case 'f':
+		return '\f', false, nil
+	case 'n':
+		return '\n', false, nil
+	case 'r':
+		return '\r', false, nil
+	case 't':
+		return '\t', false, nil
+	case 'u':
+		if *i+4 >= len(runes) {
+			return 0, false, fmt.Errorf("short unicode path escape")
+		}
+		hex := string(runes[*i+1 : *i+5])
+		u, err := strconv.ParseInt(hex, 16, 32)
+		if err != nil {
+			return 0, false, fmt.Errorf("invalid unicode path escape: %s", hex)
+		}
+		*i += 4
+		return rune(u), false, nil
+	default:
+		return r, false, nil
+	}
 }
 
 func findWord(s, sub string) int {
@@ -1685,6 +2184,9 @@ func immediateChildren(v any) []any {
 
 func valuesByKey(base any, key string) []any {
 	key = strings.TrimSpace(key)
+	if strings.HasPrefix(key, "[") && strings.HasSuffix(key, "]") {
+		return valuesByNestedExpr(base, strings.TrimSpace(key[1:len(key)-1]))
+	}
 	switch key {
 	case "*":
 		switch x := base.(type) {
@@ -1733,6 +2235,164 @@ func valuesByKey(base any, key string) []any {
 	}
 }
 
+func valuesByNestedExpr(base any, exprText string) []any {
+	cmp, err := parseComparison(exprText, &parseContext{})
+	if err != nil {
+		return nil
+	}
+	right, err := cmp.value.resolve(&Query{named: map[string]any{}, positional: map[int]any{}})
+	if err != nil {
+		return nil
+	}
+	out := make([]any, 0)
+	addIfMatched := func(selector any, value any) {
+		ok, err := compareValues(selector, cmp.op, right)
+		if err == nil && ok {
+			out = append(out, value)
+		}
+	}
+	switch x := base.(type) {
+	case map[string]any:
+		switch cmp.key {
+		case "*":
+			for k, v := range x {
+				addIfMatched(k, v)
+			}
+		case "**":
+			for _, v := range x {
+				addIfMatched(v, v)
+			}
+		default:
+			if v, ok := x[cmp.key]; ok {
+				addIfMatched(v, v)
+			}
+		}
+	case []any:
+		switch cmp.key {
+		case "*":
+			for i, v := range x {
+				addIfMatched(strconv.Itoa(i), v)
+			}
+		case "**":
+			for _, v := range x {
+				addIfMatched(v, v)
+			}
+		default:
+			if i, err := strconv.Atoi(cmp.key); err == nil && i >= 0 && i < len(x) {
+				addIfMatched(x[i], x[i])
+			}
+		}
+	}
+	return out
+}
+
+func matchFilterChain(nodes []any, chain []filterStep, q *Query) ([]any, error) {
+	cur := nodes
+	for _, step := range chain {
+		next := make([]any, 0)
+		for _, node := range cur {
+			switch step.kind {
+			case "field":
+				switch x := node.(type) {
+				case map[string]any:
+					if v, ok := x[step.key]; ok {
+						next = append(next, v)
+					}
+				case []any:
+					i, err := strconv.Atoi(step.key)
+					if err == nil && i >= 0 && i < len(x) {
+						next = append(next, x[i])
+					}
+				}
+			case "any":
+				next = append(next, immediateChildren(node)...)
+			case "desc":
+				collectDesc(node, &next)
+			case "expr":
+				selected, err := selectByExprNode(node, step.expr, q)
+				if err != nil {
+					return nil, err
+				}
+				next = append(next, selected...)
+			}
+		}
+		cur = next
+		if len(cur) == 0 {
+			return nil, nil
+		}
+	}
+	return cur, nil
+}
+
+func selectByExprNode(base any, expr exprNode, q *Query) ([]any, error) {
+	if cmp, ok := expr.(exprCmp); ok {
+		return selectByComparison(base, cmp.cmp, q)
+	}
+	ok, err := expr.eval(base, q)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return []any{base}, nil
+}
+
+func selectByComparison(base any, cmp comparison, q *Query) ([]any, error) {
+	right, err := cmp.value.resolve(q)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]any, 0)
+	addIfMatched := func(selector, value any) error {
+		ok, err := compareValues(selector, cmp.op, right)
+		if err != nil || !ok {
+			return err
+		}
+		out = append(out, value)
+		return nil
+	}
+	switch x := base.(type) {
+	case map[string]any:
+		switch cmp.key {
+		case "*":
+			for k, v := range x {
+				if err := addIfMatched(k, v); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		case "**":
+			for _, v := range x {
+				if err := addIfMatched(v, v); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		}
+	case []any:
+		switch cmp.key {
+		case "*":
+			for i, v := range x {
+				if err := addIfMatched(strconv.Itoa(i), v); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		case "**":
+			for _, v := range x {
+				if err := addIfMatched(v, v); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		}
+	}
+	for _, left := range valuesByKey(base, cmp.key) {
+		if err := addIfMatched(left, base); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func collectDesc(v any, out *[]any) {
 	*out = append(*out, v)
 	for _, c := range immediateChildren(v) {
@@ -1749,6 +2409,21 @@ func compareValues(left any, op string, right any) (bool, error) {
 		cmp, ok := jqCompare(left, right)
 		return !ok || cmp != 0, nil
 	case ">", ">=", "<", "<=":
+		if ls, lok := left.(string); lok {
+			if rs, rok := right.(string); rok {
+				ord := strings.Compare(ls, rs)
+				switch op {
+				case ">":
+					return ord > 0, nil
+				case ">=":
+					return ord >= 0, nil
+				case "<":
+					return ord < 0, nil
+				case "<=":
+					return ord <= 0, nil
+				}
+			}
+		}
 		ord, ok := jqCompare(left, right)
 		if !ok {
 			return false, nil

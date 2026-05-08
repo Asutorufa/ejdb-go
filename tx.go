@@ -50,15 +50,6 @@ func (db *DB) WriteTx(fn func(*Tx) error) error {
 	return nil
 }
 
-// Backward-compatible aliases for earlier API names.
-func (db *DB) View(fn func(*Tx) error) error {
-	return db.ReadTx(fn)
-}
-
-func (db *DB) Update(fn func(*Tx) error) error {
-	return db.WriteTx(fn)
-}
-
 func (tx *Tx) Meta() Meta {
 	return toMeta(tx.db.path, tx.state)
 }

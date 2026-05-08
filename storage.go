@@ -14,7 +14,7 @@ import (
 
 var keyMetaState = []byte("meta/state")
 
-const currentFormatVersion = 3
+const currentFormatVersion = 5
 
 const (
 	keyTagDoc  byte = 0x10

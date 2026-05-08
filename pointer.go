@@ -127,6 +127,91 @@ func pointerRemove(doc any, ptr string) error {
 	return err
 }
 
+func pointerRemovePattern(doc any, ptr string) error {
+	tokens, err := pointerTokens(ptr)
+	if err != nil {
+		return err
+	}
+	if len(tokens) == 0 {
+		return errors.New("cannot remove root")
+	}
+	removePatternAt(doc, tokens)
+	return nil
+}
+
+func removePatternAt(cur any, tokens []string) {
+	if len(tokens) == 0 {
+		return
+	}
+	t := tokens[0]
+	if len(tokens) == 1 {
+		removePatternLeaf(cur, t)
+		return
+	}
+	switch t {
+	case "*":
+		for _, child := range immediateChildren(cur) {
+			removePatternAt(child, tokens[1:])
+		}
+	case "**":
+		removePatternAt(cur, tokens[1:])
+		for _, child := range immediateChildren(cur) {
+			removePatternAt(child, tokens)
+		}
+	default:
+		switch v := cur.(type) {
+		case map[string]any:
+			if child, ok := v[t]; ok {
+				removePatternAt(child, tokens[1:])
+			}
+		case []any:
+			idx, err := strconv.Atoi(t)
+			if err == nil && idx >= 0 && idx < len(v) {
+				removePatternAt(v[idx], tokens[1:])
+			}
+		}
+	}
+}
+
+func removePatternLeaf(cur any, token string) {
+	switch v := cur.(type) {
+	case map[string]any:
+		switch token {
+		case "*":
+			for k := range v {
+				delete(v, k)
+			}
+		case "**":
+			for k := range v {
+				delete(v, k)
+			}
+			for _, child := range immediateChildren(v) {
+				removePatternLeaf(child, token)
+			}
+		default:
+			delete(v, token)
+		}
+	case []any:
+		if token == "*" || token == "**" {
+			for i := range v {
+				v[i] = nil
+			}
+			if token == "**" {
+				for _, child := range immediateChildren(v) {
+					removePatternLeaf(child, token)
+				}
+			}
+			return
+		}
+		idx, err := strconv.Atoi(token)
+		if err == nil && idx >= 0 && idx < len(v) {
+			copy(v[idx:], v[idx+1:])
+			v[len(v)-1] = nil
+			v = v[:len(v)-1]
+		}
+	}
+}
+
 func removeAt(cur any, tokens []string) (any, error) {
 	if len(tokens) == 0 {
 		return cur, nil

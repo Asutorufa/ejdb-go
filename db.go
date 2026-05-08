@@ -198,20 +198,17 @@ func (db *DB) RemoveCollection(name string) error {
 }
 
 func (db *DB) RenameCollection(oldName, newName string) error {
-	if oldName == newName {
-		return nil
-	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
 		return ErrClosed
 	}
-	if _, ok := db.state.Collections[newName]; ok {
-		return ErrCollectionExists
-	}
 	col, ok := db.state.Collections[oldName]
 	if !ok {
 		return ErrCollectionAbsent
+	}
+	if _, ok := db.state.Collections[newName]; ok {
+		return ErrCollectionExists
 	}
 	delete(db.state.Collections, oldName)
 	col.Name = newName
@@ -710,16 +707,12 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 	var bufferedSortBytes int64
 	matchedDocs := make([]matchedDoc, 0, len(candidateIDs))
 	for _, id := range candidateIDs {
-		raw, ok, err := db.rawForQueryDoc(reader, col, collection, id, useStorage)
+		raw, node, ok, err := db.docForQuery(reader, col, collection, id, useStorage)
 		if err != nil {
 			return nil, 0, false, err
 		}
 		if !ok {
 			continue
-		}
-		var node any
-		if err := decodeJSONDocument(raw, &node); err != nil {
-			return nil, 0, false, err
 		}
 		matches, err := pq.filter.match(node, id, q, state)
 		if err != nil {
@@ -775,10 +768,18 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			return li.id < lj.id
 		})
 	} else {
-		sort.Slice(matchedDocs, func(i, j int) bool { return matchedDocs[i].id < matchedDocs[j].id })
-		if pq.inverse {
-			for i, j := 0, len(matchedDocs)-1; i < j; i, j = i+1, j-1 {
-				matchedDocs[i], matchedDocs[j] = matchedDocs[j], matchedDocs[i]
+		if usedIndex {
+			if pq.inverse {
+				for i, j := 0, len(matchedDocs)-1; i < j; i, j = i+1, j-1 {
+					matchedDocs[i], matchedDocs[j] = matchedDocs[j], matchedDocs[i]
+				}
+			}
+		} else {
+			sort.Slice(matchedDocs, func(i, j int) bool { return matchedDocs[i].id > matchedDocs[j].id })
+			if pq.inverse {
+				for i, j := 0, len(matchedDocs)-1; i < j; i, j = i+1, j-1 {
+					matchedDocs[i], matchedDocs[j] = matchedDocs[j], matchedDocs[i]
+				}
 			}
 		}
 	}
@@ -826,11 +827,6 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		if affected > 0 {
 			changed = true
 		}
-		if pq.action == actionDelete {
-			for i := range window {
-				window[i].raw = nil
-			}
-		}
 	}
 
 	docs := make([]Document, 0, len(window))
@@ -855,10 +851,17 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			if err := opts.Visitor(docs[i], &step); err != nil {
 				return nil, 0, changed, err
 			}
-			if step <= 0 {
+			if step == 0 {
 				break
 			}
-			i += int(step)
+			if step < 0 {
+				i += int(step) + 1
+			} else {
+				i += int(step)
+			}
+			if i < 0 || i >= len(docs) {
+				break
+			}
 		}
 	}
 
@@ -878,26 +881,30 @@ func (db *DB) canUseStorageQuery(state *dbState) bool {
 	return state == db.state && len(db.pending) == 0 && !db.dirtyFull
 }
 
-func (db *DB) rawForQueryDoc(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (json.RawMessage, bool, error) {
+func (db *DB) docForQuery(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (json.RawMessage, any, bool, error) {
 	if useStorage {
 		stored, err := reader.Get(keyDoc(collection, id))
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
-				return nil, false, nil
+				return nil, nil, false, nil
 			}
-			return nil, false, err
+			return nil, nil, false, err
 		}
-		raw, _, err := decodeStoredDocument(stored)
+		raw, node, err := decodeStoredDocument(stored)
 		if err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
-		return raw, true, nil
+		return raw, node, true, nil
 	}
 	raw, ok := col.Docs[id]
 	if !ok {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
-	return append(json.RawMessage(nil), raw...), true, nil
+	var node any
+	if err := decodeJSONDocument(raw, &node); err != nil {
+		return nil, nil, false, err
+	}
+	return append(json.RawMessage(nil), raw...), node, true, nil
 }
 
 func (db *DB) scanDocumentIDs(reader queryReader, collection string) ([]int64, error) {
@@ -945,22 +952,52 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 	}
 	seen := make(map[int64]struct{})
 	out := make([]int64, 0)
+	dedupIDs := plan.op != "in"
 	addID := func(id int64) {
-		if _, ok := seen[id]; ok {
-			return
+		if dedupIDs {
+			if _, ok := seen[id]; ok {
+				return
+			}
+			seen[id] = struct{}{}
 		}
-		seen[id] = struct{}{}
 		out = append(out, id)
 	}
+	type indexEntry struct {
+		value string
+		id    int64
+	}
+	sortEntries := func(entries []indexEntry, valueDesc bool) {
+		sort.Slice(entries, func(i, j int) bool {
+			cmp := compareIndexKeys(idx.Kind, entries[i].value, entries[j].value)
+			if cmp == 0 {
+				if valueDesc {
+					return entries[i].id > entries[j].id
+				}
+				return entries[i].id < entries[j].id
+			}
+			if valueDesc {
+				return cmp > 0
+			}
+			return cmp < 0
+		})
+	}
 	scanNonUniqueValue := func(value string) error {
-		return scanPrefix(reader, keyIndexValuePrefix(collection, idx, value), func(key, _ []byte) error {
+		entries := make([]indexEntry, 0)
+		if err := scanPrefix(reader, keyIndexValuePrefix(collection, idx, value), func(key, _ []byte) error {
 			_, kind, path, _, id, ok := decodeIndexKey(key)
 			if !ok || kind != idx.Kind || path != idx.Path {
 				return withCode(CodeInvalidQuery, "invalid index key in storage")
 			}
-			addID(id)
+			entries = append(entries, indexEntry{value: value, id: id})
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		sortEntries(entries, false)
+		for _, entry := range entries {
+			addID(entry.id)
+		}
+		return nil
 	}
 	addUniqueValue := func(value string) error {
 		raw, err := reader.Get(keyUniqueIndex(collection, idx, value))
@@ -977,9 +1014,10 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 		addID(int64(id))
 		return nil
 	}
-	scanPath := func(match func(value string) bool) error {
+	scanPath := func(match func(value string) bool, valueDesc bool) error {
+		entries := make([]indexEntry, 0)
 		if idx.Unique {
-			return scanPrefix(reader, keyUniqueIndexPathPrefix(collection, idx), func(key, value []byte) error {
+			if err := scanPrefix(reader, keyUniqueIndexPathPrefix(collection, idx), func(key, value []byte) error {
 				_, kind, path, indexedValue, ok := decodeUniqueIndexKey(key)
 				if !ok || kind != idx.Kind || path != idx.Path {
 					return withCode(CodeInvalidQuery, "invalid unique index key in storage")
@@ -991,24 +1029,38 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 				if err != nil {
 					return err
 				}
-				addID(int64(id))
+				entries = append(entries, indexEntry{value: indexedValue, id: int64(id)})
 				return nil
-			})
+			}); err != nil {
+				return err
+			}
+			sortEntries(entries, valueDesc)
+			for _, entry := range entries {
+				addID(entry.id)
+			}
+			return nil
 		}
-		return scanPrefix(reader, keyIndexPathPrefix(collection, idx), func(key, _ []byte) error {
+		if err := scanPrefix(reader, keyIndexPathPrefix(collection, idx), func(key, _ []byte) error {
 			_, kind, path, indexedValue, id, ok := decodeIndexKey(key)
 			if !ok || kind != idx.Kind || path != idx.Path {
 				return withCode(CodeInvalidQuery, "invalid index key in storage")
 			}
 			if match(indexedValue) {
-				addID(id)
+				entries = append(entries, indexEntry{value: indexedValue, id: id})
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		sortEntries(entries, valueDesc)
+		for _, entry := range entries {
+			addID(entry.id)
+		}
+		return nil
 	}
 	switch plan.op {
 	case "":
-		if err := scanPath(func(string) bool { return true }); err != nil {
+		if err := scanPath(func(string) bool { return true }, desc); err != nil {
 			return nil, err
 		}
 	case "=":
@@ -1046,7 +1098,7 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 		if !ok {
 			return nil, nil
 		}
-		if err := scanPath(func(value string) bool { return strings.HasPrefix(value, prefix) }); err != nil {
+		if err := scanPath(func(value string) bool { return strings.HasPrefix(value, prefix) }, desc); err != nil {
 			return nil, err
 		}
 	case ">", ">=", "<", "<=":
@@ -1054,22 +1106,37 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 		if !ok {
 			return nil, nil
 		}
+		secondBound := ""
+		if plan.op2 != "" {
+			var ok bool
+			secondBound, ok = normalizeIndexValue(plan.value2, idx.Kind)
+			if !ok {
+				return nil, nil
+			}
+		}
+		valueDesc := desc
+		if !desc && plan.op2 == "" && (plan.op == "<" || plan.op == "<=") {
+			valueDesc = true
+		}
 		if err := scanPath(func(value string) bool {
 			cmp := compareIndexKeys(idx.Kind, value, bound)
-			return (plan.op == ">" && cmp > 0) ||
+			ok := (plan.op == ">" && cmp > 0) ||
 				(plan.op == ">=" && cmp >= 0) ||
 				(plan.op == "<" && cmp < 0) ||
 				(plan.op == "<=" && cmp <= 0)
-		}); err != nil {
+			if !ok || plan.op2 == "" {
+				return ok
+			}
+			cmp = compareIndexKeys(idx.Kind, value, secondBound)
+			return (plan.op2 == ">" && cmp > 0) ||
+				(plan.op2 == ">=" && cmp >= 0) ||
+				(plan.op2 == "<" && cmp < 0) ||
+				(plan.op2 == "<=" && cmp <= 0)
+		}, valueDesc); err != nil {
 			return nil, err
 		}
 	default:
 		return nil, nil
-	}
-	if desc {
-		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-			out[i], out[j] = out[j], out[i]
-		}
 	}
 	return out, nil
 }
@@ -1115,9 +1182,19 @@ func memoryIndexCandidateIDs(plan candidatePlan) []int64 {
 		}
 	case ">", ">=", "<", "<=":
 		if bound, ok := normalizeIndexValue(plan.value, rt.def.Kind); ok {
+			secondBound := ""
+			secondOK := false
+			if plan.op2 != "" {
+				secondBound, secondOK = normalizeIndexValue(plan.value2, rt.def.Kind)
+			}
 			for k := range allRuntimeIndexKeys(rt) {
 				cmp := compareIndexKeys(rt.def.Kind, k, bound)
-				if (plan.op == ">" && cmp > 0) || (plan.op == ">=" && cmp >= 0) || (plan.op == "<" && cmp < 0) || (plan.op == "<=" && cmp <= 0) {
+				ok := (plan.op == ">" && cmp > 0) || (plan.op == ">=" && cmp >= 0) || (plan.op == "<" && cmp < 0) || (plan.op == "<=" && cmp <= 0)
+				if ok && secondOK {
+					cmp = compareIndexKeys(rt.def.Kind, k, secondBound)
+					ok = (plan.op2 == ">" && cmp > 0) || (plan.op2 == ">=" && cmp >= 0) || (plan.op2 == "<" && cmp < 0) || (plan.op2 == "<=" && cmp <= 0)
+				}
+				if ok {
 					addKey(k)
 				}
 			}
@@ -1193,6 +1270,9 @@ func candidatePlanLog(plan candidatePlan, orderBy bool) string {
 	out := strings.Join(parts, "|") + " " + rt.def.Path
 	if plan.explain != "" {
 		out += " EXPR1: '" + plan.explain + "'"
+	}
+	if plan.explain2 != "" {
+		out += " EXPR2: '" + plan.explain2 + "'"
 	}
 	if plan.cursorInit != "" {
 		out += " INIT: " + plan.cursorInit
@@ -1449,14 +1529,16 @@ func (db *DB) applyProjectionLocked(state *dbState, q *Query, raw []byte, spec *
 		return nil, err
 	}
 	var out any = map[string]any{}
-	for _, term := range spec.terms {
+	for i, term := range spec.terms {
 		if term.all {
 			if term.include {
-				cl, err := cloneAny(src)
-				if err != nil {
-					return nil, err
+				if i == 0 {
+					cl, err := cloneAny(src)
+					if err != nil {
+						return nil, err
+					}
+					out = cl
 				}
-				out = cl
 			} else {
 				out = map[string]any{}
 			}
@@ -1485,7 +1567,11 @@ func (db *DB) applyProjectionLocked(state *dbState, q *Query, raw []byte, spec *
 				return nil, err
 			}
 		} else {
-			_ = pointerRemove(out, path)
+			if strings.Contains(path, "*") {
+				_ = pointerRemovePattern(out, path)
+			} else {
+				_ = pointerRemove(out, path)
+			}
 		}
 	}
 	return json.Marshal(out)
