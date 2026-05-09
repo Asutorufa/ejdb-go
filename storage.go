@@ -60,6 +60,11 @@ type StorageIterator interface {
 	Close() error
 }
 
+type reverseStorageIterator interface {
+	Last() bool
+	Prev() bool
+}
+
 type PebbleEngine struct {
 	opts      *pebble.Options
 	writeOpts *pebble.WriteOptions
@@ -223,6 +228,14 @@ func (i *pebbleIterator) First() bool {
 
 func (i *pebbleIterator) Next() bool {
 	return i.it.Next()
+}
+
+func (i *pebbleIterator) Last() bool {
+	return i.it.Last()
+}
+
+func (i *pebbleIterator) Prev() bool {
+	return i.it.Prev()
 }
 
 func (i *pebbleIterator) Valid() bool {

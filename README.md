@@ -130,6 +130,22 @@ For a quick local trend check:
 go test -bench . -benchmem -benchtime=200ms ./...
 ```
 
+### Sample Core Benchmark Results
+
+Sample environment:
+
+- `goos: linux`
+- `goarch: amd64`
+- `cpu: AMD Ryzen 5 5600G with Radeon Graphics`
+- Command: `go test -run '^$' -bench '^(BenchmarkRangeQuery|BenchmarkSortPagination|BenchmarkPutNewWriteTx|BenchmarkUpdateDelete)$' -benchmem ./...`
+
+| Workload | ns/op | docs/s | ops/s | B/op | allocs/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `BenchmarkPutNewWriteTx` | 101445 | 9881 | 9881 | 2161 | 41 |
+| `BenchmarkRangeQuery` | 484321 | 206486 | 2065 | 139792 | 3254 |
+| `BenchmarkSortPagination` | 666022 | 75077 | 1502 | 175237 | 4289 |
+| `BenchmarkUpdateDelete` | 90787 | 22031 | 11015 | 14634 | 301 |
+
 ### Sample Pebble Config Comparison
 
 Sample environment:
@@ -147,28 +163,28 @@ Configurations:
 - `sync_writes`: 8 MiB block cache, 4 MiB memtable, synced writes.
 - `disable_wal`: 8 MiB block cache, 4 MiB memtable, Pebble WAL disabled; faster but not crash-safe.
 
-| Config | Workload | ns/op | docs/s | ops/s |
-| --- | --- | ---: | ---: | ---: |
-| `default` | PutNew | 10225 | 99769 | 99769 |
-| `default` | GetByID | 3809 | 262641 | 262641 |
-| `default` | Indexed query | 9012 | 110994 | 110994 |
-| `default` | Range query | 3738430 | 26757 | 267.6 |
-| `small_cache_1m` | PutNew | 16453 | 60790 | 60790 |
-| `small_cache_1m` | GetByID | 10764 | 92924 | 92924 |
-| `small_cache_1m` | Indexed query | 23419 | 42712 | 42712 |
-| `small_cache_1m` | Range query | 4635217 | 21582 | 215.8 |
-| `large_cache_64m` | PutNew | 9443 | 105929 | 105929 |
-| `large_cache_64m` | GetByID | 2561 | 390633 | 390633 |
-| `large_cache_64m` | Indexed query | 6662 | 150146 | 150146 |
-| `large_cache_64m` | Range query | 3612264 | 27693 | 276.9 |
-| `sync_writes` | PutNew | 17047 | 58675 | 58675 |
-| `sync_writes` | GetByID | 3729 | 268436 | 268436 |
-| `sync_writes` | Indexed query | 9124 | 109713 | 109713 |
-| `sync_writes` | Range query | 3761250 | 26611 | 266.1 |
-| `disable_wal` | PutNew | 11292 | 88577 | 88577 |
-| `disable_wal` | GetByID | 3773 | 265175 | 265175 |
-| `disable_wal` | Indexed query | 8859 | 112912 | 112912 |
-| `disable_wal` | Range query | 3718093 | 26905 | 269.0 |
+| Config | Workload | ns/op | docs/s | ops/s | B/op | allocs/op |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `default` | PutNew | 11395 | 87835 | 87835 | 2383 | 51 |
+| `default` | GetByID | 3837 | 260850 | 260850 | 918 | 25 |
+| `default` | Indexed query | 8984 | 111346 | 111346 | 2031 | 58 |
+| `default` | Range query | 512434 | 195199 | 1952 | 139875 | 3254 |
+| `small_cache_1m` | PutNew | 15216 | 65734 | 65734 | 2485 | 52 |
+| `small_cache_1m` | GetByID | 10986 | 91055 | 91055 | 717 | 23 |
+| `small_cache_1m` | Indexed query | 24007 | 41665 | 41665 | 1607 | 54 |
+| `small_cache_1m` | Range query | 1255292 | 79684 | 796.8 | 119442 | 3062 |
+| `large_cache_64m` | PutNew | 8529 | 117282 | 117282 | 2329 | 51 |
+| `large_cache_64m` | GetByID | 2569 | 389402 | 389402 | 849 | 23 |
+| `large_cache_64m` | Indexed query | 6528 | 153235 | 153235 | 1957 | 57 |
+| `large_cache_64m` | Range query | 340026 | 294200 | 2942 | 132265 | 3151 |
+| `sync_writes` | PutNew | 14219 | 70343 | 70343 | 2372 | 51 |
+| `sync_writes` | GetByID | 3782 | 264684 | 264684 | 920 | 25 |
+| `sync_writes` | Indexed query | 8993 | 111293 | 111293 | 2032 | 58 |
+| `sync_writes` | Range query | 488553 | 204899 | 2049 | 139704 | 3253 |
+| `disable_wal` | PutNew | 11134 | 89836 | 89836 | 2362 | 51 |
+| `disable_wal` | GetByID | 3725 | 268552 | 268552 | 920 | 25 |
+| `disable_wal` | Indexed query | 9514 | 105137 | 105137 | 2024 | 58 |
+| `disable_wal` | Range query | 484369 | 206521 | 2065 | 139598 | 3253 |
 
 The storage model is disk-backed and benchmark results are sensitive to Pebble options, filesystem cache state, and benchmark duration. Re-run the benchmark on the target machine before using these numbers for capacity planning.
 

@@ -162,7 +162,7 @@ func (tx *Tx) Delete(collection string, id int64) error {
 	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
-	tx.db.recordDocDelete(col.Name, id, raw)
+	tx.db.recordDocDelete(col.Name, id, raw, doc)
 	if col.RNum > 0 {
 		col.RNum--
 	}

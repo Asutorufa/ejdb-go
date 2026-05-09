@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	json "github.com/go-json-experiment/json"
@@ -1081,6 +1082,152 @@ func collectN(t *testing.T, db *DB, collection, query string, limit int64) []int
 		out = append(out, int(m["n"].(float64)))
 	}
 	return out
+}
+
+func TestIndexedOrderPaginationWindow(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.EnsureIndexMode("page", "/v", IdxInt64); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		if _, err := db.PutNew("page", []byte(fmt.Sprintf(`{"v":%d,"n":%d}`, i, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := collectN(t, db, "page", "/* | asc /v | skip 17 limit 9", 0), []int{17, 18, 19, 20, 21, 22, 23, 24, 25}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("asc indexed page got=%v want=%v", got, want)
+	}
+	if got, want := collectN(t, db, "page", "/* | desc /v | skip 17 limit 9", 0), []int{182, 181, 180, 179, 178, 177, 176, 175, 174}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("desc indexed page got=%v want=%v", got, want)
+	}
+}
+
+func TestIndexedFloatRangeBounds(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.EnsureIndexMode("float_unique", "/v", IdxUnique|IdxFloat); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range []float64{-2.5, -1, 0, 1.25, 2.5, 4} {
+		if _, err := db.PutNew("float_unique", []byte(fmt.Sprintf(`{"v":%g,"n":%d}`, v, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := collectN(t, db, "float_unique", "/[v > -1 and v <= 2.5] | asc /v", 0), []int{2, 3, 4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unique float range got=%v want=%v", got, want)
+	}
+	if got, want := collectN(t, db, "float_unique", "/[v >= -1 and v < 4] | desc /v", 0), []int{4, 3, 2, 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unique float desc range got=%v want=%v", got, want)
+	}
+
+	if err := db.EnsureIndexMode("float_multi", "/v", IdxFloat); err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range []float64{1.5, 2.5, 1.5, 3.5, 2.5} {
+		if _, err := db.PutNew("float_multi", []byte(fmt.Sprintf(`{"v":%g,"n":%d}`, v, i+1))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := collectN(t, db, "float_multi", "/[v >= 1.5 and v < 3] | asc /v", 0), []int{1, 3, 2, 5}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("non-unique float range got=%v want=%v", got, want)
+	}
+}
+
+func TestConcurrentReadQueryAndWriteMutation(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.EnsureIndexMode("concurrent", "/v", IdxInt64); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := db.PutNew("concurrent", []byte(fmt.Sprintf(`{"v":%d,"n":%d}`, i, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	errCh := make(chan error, 16)
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				if _, err := db.Get("concurrent", int64((i+offset)%100+1)); err != nil && !errors.Is(err, ErrNotFound) {
+					errCh <- err
+					return
+				}
+				q, err := NewQuery("concurrent", "/[v >= 10 and v < 90] | asc /v | skip 3 limit 7")
+				if err != nil {
+					errCh <- err
+					return
+				}
+				docs, err := db.ListQuery(q, 0)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				for _, doc := range docs {
+					var m map[string]any
+					if err := json.Unmarshal(doc.Raw, &m); err != nil {
+						errCh <- err
+						return
+					}
+				}
+				qCount, err := NewQuery("concurrent", "/[v >= 0]")
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := db.Count(qCount, 0); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(r)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 40; i++ {
+			if err := db.Put("concurrent", int64(i%100+1), []byte(fmt.Sprintf(`{"v":%d,"n":%d}`, i%100, i))); err != nil {
+				errCh <- err
+				return
+			}
+			id, err := db.PutNew("concurrent", []byte(fmt.Sprintf(`{"v":%d,"n":%d}`, 1000+i, 1000+i)))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			q, err := NewQuery("concurrent", "/[v = :?] | apply {\"seen\":true}")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := q.SetI64("", 0, int64(1000+i)); err != nil {
+				errCh <- err
+				return
+			}
+			if _, err := db.UpdateQuery(q, 0); err != nil {
+				errCh <- err
+				return
+			}
+			if err := db.Delete("concurrent", id); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestOfficialPlannerRangePrefixAndComparison(t *testing.T) {

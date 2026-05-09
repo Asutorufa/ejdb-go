@@ -1,6 +1,7 @@
 package ejdb
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"math"
@@ -42,6 +43,8 @@ type storageMutation struct {
 	id         int64
 	oldRaw     jsontext.Value
 	newRaw     jsontext.Value
+	oldDoc     any
+	newDoc     any
 }
 
 func Open(opts Options) (*DB, error) {
@@ -259,15 +262,11 @@ func (db *DB) Delete(collection string, id int64) error {
 	if !ok {
 		return ErrNotFound
 	}
-	raw, err := db.getDocRaw(db.engine, col, id)
+	raw, doc, err := db.getDocNode(db.engine, col, id)
 	if err != nil {
 		return err
 	}
-	var doc any
-	if err := decodeJSONDocument(raw, &doc); err != nil {
-		return err
-	}
-	db.recordDocDelete(col.Name, id, raw)
+	db.recordDocDelete(col.Name, id, raw, doc)
 	if col.RNum > 0 {
 		col.RNum--
 	}
@@ -641,6 +640,20 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		}
 		sortPaths = append(sortPaths, path)
 	}
+	skip, err := resolveIntOption(q, pq.skip, pq.skipPH, "skip")
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if opts.Skip > 0 {
+		skip = int(opts.Skip)
+	}
+	limit, err := resolveIntOption(q, pq.limit, pq.limitPH, "limit")
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if opts.Limit > 0 {
+		limit = int(opts.Limit)
+	}
 	useStorage := db.canUseStorageQuery(state)
 	var reader queryReader
 	var snap StorageSnapshot
@@ -652,6 +665,7 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		reader = db.engine
 	}
 	var candidateIDs []int64
+	var scanCandidateIDs func(func(int64) (bool, error)) error
 	var candidate candidatePlan
 	usedIndex := false
 	usedOrderIndex := false
@@ -662,7 +676,10 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			var err error
 			orderByCandidate := len(sortPaths) == 1 && plan.idx.Path == sortPaths[0]
 			if useStorage {
-				candidateIDs, err = db.scanIndexCandidateIDs(reader, collection, plan, orderByCandidate && pq.sorts[0].desc)
+				desc := orderByCandidate && pq.sorts[0].desc
+				scanCandidateIDs = func(yield func(int64) (bool, error)) error {
+					return db.scanIndexCandidateIDsFunc(reader, collection, plan, desc, yield)
+				}
 			} else {
 				candidateIDs = memoryIndexCandidateIDs(plan)
 				if orderByCandidate {
@@ -679,7 +696,10 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 				candidate = plan
 				var err error
 				if useStorage {
-					candidateIDs, err = db.scanIndexCandidateIDs(reader, collection, plan, pq.sorts[0].desc)
+					desc := pq.sorts[0].desc
+					scanCandidateIDs = func(yield func(int64) (bool, error)) error {
+						return db.scanIndexCandidateIDsFunc(reader, collection, plan, desc, yield)
+					}
 				} else {
 					candidateIDs = orderedIDsFromIndex(plan.index, pq.sorts[0].desc)
 				}
@@ -691,7 +711,7 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			}
 		}
 	}
-	if candidateIDs == nil {
+	if candidateIDs == nil && scanCandidateIDs == nil {
 		var err error
 		if useStorage {
 			candidateIDs, err = db.scanDocumentIDs(reader, col)
@@ -729,18 +749,22 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		}
 	}()
 	var bufferedSortBytes int64
-	matchedDocs := make([]matchedDoc, 0, len(candidateIDs))
-	for _, id := range candidateIDs {
+	capHint := len(candidateIDs)
+	if usedOrderIndex && limit >= 0 && limit < capHint {
+		capHint = limit
+	}
+	matchedDocs := make([]matchedDoc, 0, capHint)
+	addMatchedDoc := func(id int64) error {
 		raw, node, ok, err := db.docForQuery(reader, col, collection, id, useStorage)
 		if err != nil {
-			return nil, 0, false, err
+			return err
 		}
 		if !ok {
-			continue
+			return nil
 		}
 		matches, err := pq.filter.match(node, id, q, state)
 		if err != nil {
-			return nil, 0, false, err
+			return err
 		}
 		if matches {
 			m := matchedDoc{id: id, raw: append(jsontext.Value(nil), raw...), node: node}
@@ -757,13 +781,64 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 					var err error
 					spill, err = newSortSpill()
 					if err != nil {
-						return nil, 0, false, err
+						return err
 					}
 				}
 				if err := spillMatchedDocs(spill, matchedDocs); err != nil {
-					return nil, 0, false, err
+					return err
 				}
 				bufferedSortBytes = 0
+			}
+		}
+		return nil
+	}
+	streamedWindow := usedOrderIndex && scanCandidateIDs != nil
+	if streamedWindow {
+		if limit != 0 {
+			skipped := 0
+			err := scanCandidateIDs(func(id int64) (bool, error) {
+				if limit >= 0 && len(matchedDocs) >= limit {
+					return false, nil
+				}
+				raw, node, ok, err := db.docForQuery(reader, col, collection, id, useStorage)
+				if err != nil {
+					return false, err
+				}
+				if !ok {
+					return true, nil
+				}
+				matches, err := pq.filter.match(node, id, q, state)
+				if err != nil {
+					return false, err
+				}
+				if !matches {
+					return true, nil
+				}
+				if skipped < skip {
+					skipped++
+					return true, nil
+				}
+				matchedDocs = append(matchedDocs, matchedDoc{id: id, raw: append(jsontext.Value(nil), raw...), node: node})
+				if limit >= 0 && len(matchedDocs) >= limit {
+					return false, nil
+				}
+				return true, nil
+			})
+			if err != nil {
+				return nil, 0, false, err
+			}
+		}
+	} else {
+		if candidateIDs == nil && scanCandidateIDs != nil {
+			var err error
+			candidateIDs, err = db.scanIndexCandidateIDs(reader, collection, candidate, usedOrderIndex && len(pq.sorts) > 0 && pq.sorts[0].desc)
+			if err != nil {
+				return nil, 0, false, err
+			}
+		}
+		for _, id := range candidateIDs {
+			if err := addMatchedDoc(id); err != nil {
+				return nil, 0, false, err
 			}
 		}
 	}
@@ -808,27 +883,17 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		}
 	}
 
-	skip, err := resolveIntOption(q, pq.skip, pq.skipPH, "skip")
-	if err != nil {
-		return nil, 0, false, err
-	}
-	if opts.Skip > 0 {
-		skip = int(opts.Skip)
-	}
-	limit, err := resolveIntOption(q, pq.limit, pq.limitPH, "limit")
-	if err != nil {
-		return nil, 0, false, err
-	}
-	if opts.Limit > 0 {
-		limit = int(opts.Limit)
-	}
 	start := skip
-	if start > len(matchedDocs) {
-		start = len(matchedDocs)
-	}
 	end := len(matchedDocs)
-	if limit >= 0 && start+limit < end {
-		end = start + limit
+	if streamedWindow {
+		start = 0
+	} else {
+		if start > len(matchedDocs) {
+			start = len(matchedDocs)
+		}
+		if limit >= 0 && start+limit < end {
+			end = start + limit
+		}
 	}
 	window := matchedDocs[start:end]
 	if spill != nil {
@@ -912,18 +977,19 @@ func (db *DB) canUseStorageQuery(state *dbState) bool {
 }
 
 func (db *DB) docForQuery(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (jsontext.Value, any, bool, error) {
-	if raw, ok, deleted, err := db.pendingDoc(collection, id); ok || deleted || err != nil {
+	if raw, doc, ok, deleted, err := db.pendingDocState(collection, id); ok || deleted || err != nil {
 		if err != nil {
 			return nil, nil, false, err
 		}
 		if deleted {
 			return nil, nil, false, nil
 		}
-		var node any
-		if err := decodeJSONDocument(raw, &node); err != nil {
-			return nil, nil, false, err
+		if doc == nil {
+			if err := decodeJSONDocument(raw, &doc); err != nil {
+				return nil, nil, false, err
+			}
 		}
-		return raw, node, true, nil
+		return raw, doc, true, nil
 	}
 	if useStorage || reader != nil {
 		stored, err := reader.Get(keyDoc(col.DBID, id))
@@ -989,17 +1055,22 @@ func (db *DB) scanDocumentIDs(reader queryReader, col *collectionState) ([]int64
 }
 
 func (db *DB) pendingDoc(collection string, id int64) (jsontext.Value, bool, bool, error) {
+	raw, _, ok, deleted, err := db.pendingDocState(collection, id)
+	return raw, ok, deleted, err
+}
+
+func (db *DB) pendingDocState(collection string, id int64) (jsontext.Value, any, bool, bool, error) {
 	for i := len(db.pending) - 1; i >= 0; i-- {
 		m := db.pending[i]
 		if m.collection != collection || m.id != id {
 			continue
 		}
 		if m.kind == mutationDelete {
-			return nil, false, true, nil
+			return nil, nil, false, true, nil
 		}
-		return append(jsontext.Value(nil), m.newRaw...), true, false, nil
+		return append(jsontext.Value(nil), m.newRaw...), m.newDoc, true, false, nil
 	}
-	return nil, false, false, nil
+	return nil, nil, false, false, nil
 }
 
 func chooseOrderByIndexPlan(col *collectionState, path string, desc bool) (candidatePlan, bool) {
@@ -1024,24 +1095,33 @@ func chooseOrderByIndexPlan(col *collectionState, path string, desc bool) (candi
 }
 
 func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan candidatePlan, desc bool) ([]int64, error) {
+	out := make([]int64, 0)
+	err := db.scanIndexCandidateIDsFunc(reader, collection, plan, desc, func(id int64) (bool, error) {
+		out = append(out, id)
+		return true, nil
+	})
+	return out, err
+}
+
+func (db *DB) scanIndexCandidateIDsFunc(reader queryReader, collection string, plan candidatePlan, desc bool, yield func(int64) (bool, error)) error {
+	_ = collection
 	if plan.index == nil {
-		return nil, nil
+		return nil
 	}
 	idx := plan.idx
 	if idx.Path == "" {
 		idx = plan.index.def
 	}
 	seen := make(map[int64]struct{})
-	out := make([]int64, 0)
 	dedupIDs := plan.op != "in"
-	addID := func(id int64) {
+	addID := func(id int64) (bool, error) {
 		if dedupIDs {
 			if _, ok := seen[id]; ok {
-				return
+				return true, nil
 			}
 			seen[id] = struct{}{}
 		}
-		out = append(out, id)
+		return yield(id)
 	}
 	type indexEntry struct {
 		value string
@@ -1062,6 +1142,15 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 			return cmp < 0
 		})
 	}
+	emitEntries := func(entries []indexEntry) error {
+		for _, entry := range entries {
+			cont, err := addID(entry.id)
+			if err != nil || !cont {
+				return err
+			}
+		}
+		return nil
+	}
 	scanNonUniqueValue := func(value string) error {
 		entries := make([]indexEntry, 0)
 		if err := scanPrefix(reader, keyIndexValuePrefix(idx, value), func(key, _ []byte) error {
@@ -1075,10 +1164,7 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 			return err
 		}
 		sortEntries(entries, false)
-		for _, entry := range entries {
-			addID(entry.id)
-		}
-		return nil
+		return emitEntries(entries)
 	}
 	addUniqueValue := func(value string) error {
 		raw, err := reader.Get(keyUniqueIndex(idx, value))
@@ -1092,8 +1178,75 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 		if err != nil {
 			return err
 		}
-		addID(int64(id))
-		return nil
+		_, err = addID(int64(id))
+		return err
+	}
+	scanOrderedRange := func(lower, upper []byte, valueDesc bool) error {
+		if len(lower) > 0 && len(upper) > 0 && bytes.Compare(lower, upper) >= 0 {
+			return nil
+		}
+		it, err := reader.NewIterator(lower, upper)
+		if err != nil {
+			return err
+		}
+		defer it.Close()
+		decode := func(key, value []byte) (indexEntry, error) {
+			if idx.Unique {
+				dbid, indexedValue, ok := decodeUniqueIndexKey(key)
+				if !ok || dbid != idx.DBID {
+					return indexEntry{}, withCode(CodeInvalidQuery, "invalid unique index key in storage")
+				}
+				uid, err := parseU64(value)
+				if err != nil {
+					return indexEntry{}, err
+				}
+				return indexEntry{value: indexedValue, id: int64(uid)}, nil
+			}
+			dbid, indexedValue, id, ok := decodeIndexKey(key)
+			if !ok || dbid != idx.DBID {
+				return indexEntry{}, withCode(CodeInvalidQuery, "invalid index key in storage")
+			}
+			return indexEntry{value: indexedValue, id: id}, nil
+		}
+		if valueDesc {
+			if rev, ok := it.(reverseStorageIterator); ok {
+				for ok := rev.Last(); ok; ok = rev.Prev() {
+					entry, err := decode(it.Key(), it.Value())
+					if err != nil {
+						return err
+					}
+					cont, err := addID(entry.id)
+					if err != nil || !cont {
+						return err
+					}
+				}
+				return it.Error()
+			}
+			entries := make([]indexEntry, 0)
+			for ok := it.First(); ok; ok = it.Next() {
+				entry, err := decode(it.Key(), it.Value())
+				if err != nil {
+					return err
+				}
+				entries = append(entries, entry)
+			}
+			if err := it.Error(); err != nil {
+				return err
+			}
+			sortEntries(entries, true)
+			return emitEntries(entries)
+		}
+		for ok := it.First(); ok; ok = it.Next() {
+			entry, err := decode(it.Key(), it.Value())
+			if err != nil {
+				return err
+			}
+			cont, err := addID(entry.id)
+			if err != nil || !cont {
+				return err
+			}
+		}
+		return it.Error()
 	}
 	scanPath := func(match func(value string) bool, valueDesc bool) error {
 		entries := make([]indexEntry, 0)
@@ -1116,10 +1269,7 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 				return err
 			}
 			sortEntries(entries, valueDesc)
-			for _, entry := range entries {
-				addID(entry.id)
-			}
-			return nil
+			return emitEntries(entries)
 		}
 		if err := scanPrefix(reader, keyIndexPathPrefix(idx), func(key, _ []byte) error {
 			dbid, indexedValue, id, ok := decodeIndexKey(key)
@@ -1134,32 +1284,34 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 			return err
 		}
 		sortEntries(entries, valueDesc)
-		for _, entry := range entries {
-			addID(entry.id)
-		}
-		return nil
+		return emitEntries(entries)
 	}
 	switch plan.op {
 	case "":
-		if err := scanPath(func(string) bool { return true }, desc); err != nil {
-			return nil, err
+		if idx.Kind == IndexInt64 || idx.Kind == IndexFloat {
+			pathPrefix := indexScanPathPrefix(idx)
+			if err := scanOrderedRange(pathPrefix, prefixEnd(pathPrefix), desc); err != nil {
+				return err
+			}
+		} else if err := scanPath(func(string) bool { return true }, desc); err != nil {
+			return err
 		}
 	case "=":
 		value, ok := normalizeIndexValue(plan.value, idx.Kind)
 		if !ok {
-			return nil, nil
+			return nil
 		}
 		if idx.Unique {
 			if err := addUniqueValue(value); err != nil {
-				return nil, err
+				return err
 			}
 		} else if err := scanNonUniqueValue(value); err != nil {
-			return nil, err
+			return err
 		}
 	case "in":
 		arr, ok := toAnySlice(plan.value)
 		if !ok {
-			return nil, nil
+			return nil
 		}
 		for _, it := range arr {
 			value, ok := normalizeIndexValue(it, idx.Kind)
@@ -1168,38 +1320,38 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 			}
 			if idx.Unique {
 				if err := addUniqueValue(value); err != nil {
-					return nil, err
+					return err
 				}
 			} else if err := scanNonUniqueValue(value); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	case "prefix":
 		prefix, ok := jqPrefixString(toJQValue(plan.value))
 		if !ok {
-			return nil, nil
+			return nil
 		}
 		if err := scanPath(func(value string) bool { return strings.HasPrefix(value, prefix) }, desc); err != nil {
-			return nil, err
+			return err
 		}
 	case ">", ">=", "<", "<=":
 		bound, ok := normalizeIndexValue(plan.value, idx.Kind)
 		if !ok {
-			return nil, nil
+			return nil
 		}
 		secondBound := ""
 		if plan.op2 != "" {
 			var ok bool
 			secondBound, ok = normalizeIndexValue(plan.value2, idx.Kind)
 			if !ok {
-				return nil, nil
+				return nil
 			}
 		}
 		valueDesc := desc
 		if !desc && plan.op2 == "" && (plan.op == "<" || plan.op == "<=") {
 			valueDesc = true
 		}
-		if err := scanPath(func(value string) bool {
+		matchRange := func(value string) bool {
 			cmp := compareIndexKeys(idx.Kind, value, bound)
 			ok := (plan.op == ">" && cmp > 0) ||
 				(plan.op == ">=" && cmp >= 0) ||
@@ -1213,13 +1365,94 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 				(plan.op2 == ">=" && cmp >= 0) ||
 				(plan.op2 == "<" && cmp < 0) ||
 				(plan.op2 == "<=" && cmp <= 0)
-		}, valueDesc); err != nil {
-			return nil, err
+		}
+		if idx.Kind == IndexInt64 || idx.Kind == IndexFloat {
+			lower, upper, ok := indexRangeKeyBounds(idx, plan, bound, secondBound)
+			if !ok {
+				return nil
+			}
+			if err := scanOrderedRange(lower, upper, valueDesc); err != nil {
+				return err
+			}
+		} else if err := scanPath(matchRange, valueDesc); err != nil {
+			return err
 		}
 	default:
-		return nil, nil
+		return nil
 	}
-	return out, nil
+	return nil
+}
+
+func indexRangeKeyBounds(idx indexState, plan candidatePlan, bound, secondBound string) ([]byte, []byte, bool) {
+	type rangeSide struct {
+		value     string
+		inclusive bool
+		set       bool
+	}
+	lower := rangeSide{}
+	upper := rangeSide{}
+	add := func(op, value string) bool {
+		switch op {
+		case ">":
+			lower = rangeSide{value: value, inclusive: false, set: true}
+		case ">=":
+			lower = rangeSide{value: value, inclusive: true, set: true}
+		case "<":
+			upper = rangeSide{value: value, inclusive: false, set: true}
+		case "<=":
+			upper = rangeSide{value: value, inclusive: true, set: true}
+		default:
+			return false
+		}
+		return true
+	}
+	if !add(plan.op, bound) {
+		return nil, nil, false
+	}
+	if plan.op2 != "" && !add(plan.op2, secondBound) {
+		return nil, nil, false
+	}
+	pathPrefix := indexScanPathPrefix(idx)
+	var lowerKey []byte
+	if lower.set {
+		prefix := indexScanValuePrefix(idx, lower.value)
+		if lower.inclusive {
+			lowerKey = prefix
+		} else {
+			lowerKey = prefixEnd(prefix)
+		}
+	} else {
+		lowerKey = pathPrefix
+	}
+	var upperKey []byte
+	if upper.set {
+		prefix := indexScanValuePrefix(idx, upper.value)
+		if upper.inclusive {
+			upperKey = prefixEnd(prefix)
+		} else {
+			upperKey = prefix
+		}
+	} else {
+		upperKey = prefixEnd(pathPrefix)
+	}
+	if len(lowerKey) > 0 && len(upperKey) > 0 && bytes.Compare(lowerKey, upperKey) > 0 {
+		return nil, nil, false
+	}
+	return lowerKey, upperKey, true
+}
+
+func indexScanPathPrefix(idx indexState) []byte {
+	if idx.Unique {
+		return keyUniqueIndexPathPrefix(idx)
+	}
+	return keyIndexPathPrefix(idx)
+}
+
+func indexScanValuePrefix(idx indexState, value string) []byte {
+	if idx.Unique {
+		return keyUniqueIndexValuePrefix(idx, value)
+	}
+	return keyIndexValuePrefix(idx, value)
 }
 
 func memoryIndexCandidateIDs(plan candidatePlan) []int64 {
@@ -1541,7 +1774,7 @@ func (db *DB) applyActionLocked(state *dbState, col *collectionState, q *Query, 
 		return 0, nil
 	case actionDelete:
 		for _, m := range window {
-			db.recordDocDelete(col.Name, m.id, m.raw)
+			db.recordDocDelete(col.Name, m.id, m.raw, m.node)
 			if col.RNum > 0 {
 				col.RNum--
 			}
@@ -1746,28 +1979,25 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 	}
 	var oldRaw jsontext.Value
 	var oldDoc any
-	var old jsontext.Value
 	exists := false
-	if raw, ok, deleted, perr := db.pendingDoc(col.Name, id); ok || deleted || perr != nil {
+	if raw, doc, ok, deleted, perr := db.pendingDocState(col.Name, id); ok || deleted || perr != nil {
 		if perr != nil {
 			return perr
 		}
 		if ok {
-			old = raw
+			oldRaw = append(jsontext.Value(nil), raw...)
+			oldDoc = doc
 			exists = true
 		}
 	} else {
-		var getErr error
-		old, getErr = db.getDocRaw(db.engine, col, id)
+		old, doc, getErr := db.getDocNode(db.engine, col, id)
 		exists = getErr == nil
 		if getErr != nil && !errors.Is(getErr, ErrNotFound) {
 			return getErr
 		}
-	}
-	if exists {
-		oldRaw = append(jsontext.Value(nil), old...)
-		if err := decodeJSONDocument(old, &oldDoc); err != nil {
-			return err
+		if exists {
+			oldRaw = append(jsontext.Value(nil), old...)
+			oldDoc = doc
 		}
 	}
 	if err := db.checkUniqueConstraints(col, id, doc); err != nil {
@@ -1777,7 +2007,7 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 		col.RNum++
 	}
 	db.adjustIndexRNums(col, oldDoc, doc)
-	db.recordDocPut(col.Name, id, oldRaw, canon)
+	db.recordDocPut(col.Name, id, oldRaw, canon, oldDoc, doc)
 	return nil
 }
 
@@ -1836,7 +2066,7 @@ func (db *DB) checkUniqueConstraints(col *collectionState, id int64, doc any) er
 		for _, v := range newVals {
 			want[v] = struct{}{}
 		}
-		pending := make(map[int64]jsontext.Value)
+		pending := make(map[int64]storageMutation)
 		deleted := make(map[int64]struct{})
 		for _, m := range db.pending {
 			if m.collection != col.Name || m.id == id {
@@ -1844,7 +2074,7 @@ func (db *DB) checkUniqueConstraints(col *collectionState, id int64, doc any) er
 			}
 			switch m.kind {
 			case mutationPut:
-				pending[m.id] = m.newRaw
+				pending[m.id] = m
 				delete(deleted, m.id)
 			case mutationDelete:
 				delete(pending, m.id)
@@ -1852,10 +2082,12 @@ func (db *DB) checkUniqueConstraints(col *collectionState, id int64, doc any) er
 			}
 		}
 		_ = deleted
-		for otherID, raw := range pending {
-			var other any
-			if err := decodeJSONDocument(raw, &other); err != nil {
-				return err
+		for otherID, m := range pending {
+			other := m.newDoc
+			if other == nil {
+				if err := decodeJSONDocument(m.newRaw, &other); err != nil {
+					return err
+				}
 			}
 			for _, v := range valuesForIndex(other, idx.Path, idx.Kind) {
 				if _, ok := want[v]; ok && otherID != id {
@@ -1909,6 +2141,13 @@ func (db *DB) encodeStoredRaw(raw []byte) ([]byte, error) {
 	var doc any
 	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return nil, err
+	}
+	return encodeStoredDocument(doc)
+}
+
+func (db *DB) encodeStoredDoc(raw []byte, doc any) ([]byte, error) {
+	if doc == nil {
+		return db.encodeStoredRaw(raw)
 	}
 	return encodeStoredDocument(doc)
 }
@@ -2190,23 +2429,26 @@ func (db *DB) markFullDirty() {
 	db.dirtyMeta = true
 }
 
-func (db *DB) recordDocPut(collection string, id int64, oldRaw, newRaw jsontext.Value) {
+func (db *DB) recordDocPut(collection string, id int64, oldRaw, newRaw jsontext.Value, oldDoc, newDoc any) {
 	db.pending = append(db.pending, storageMutation{
 		kind:       mutationPut,
 		collection: collection,
 		id:         id,
 		oldRaw:     append(jsontext.Value(nil), oldRaw...),
 		newRaw:     append(jsontext.Value(nil), newRaw...),
+		oldDoc:     oldDoc,
+		newDoc:     newDoc,
 	})
 	db.dirtyMeta = true
 }
 
-func (db *DB) recordDocDelete(collection string, id int64, oldRaw jsontext.Value) {
+func (db *DB) recordDocDelete(collection string, id int64, oldRaw jsontext.Value, oldDoc any) {
 	db.pending = append(db.pending, storageMutation{
 		kind:       mutationDelete,
 		collection: collection,
 		id:         id,
 		oldRaw:     append(jsontext.Value(nil), oldRaw...),
+		oldDoc:     oldDoc,
 	})
 	db.dirtyMeta = true
 }
@@ -2243,22 +2485,22 @@ func (db *DB) persistPendingLocked() error {
 		switch m.kind {
 		case mutationPut:
 			if len(m.oldRaw) > 0 {
-				if err := db.deleteIndexKeys(b, m.collection, m.id, m.oldRaw); err != nil {
+				if err := db.deleteIndexKeys(b, m.collection, m.id, m.oldRaw, m.oldDoc); err != nil {
 					return err
 				}
 			}
-			stored, err := db.encodeStoredRaw(m.newRaw)
+			stored, err := db.encodeStoredDoc(m.newRaw, m.newDoc)
 			if err != nil {
 				return err
 			}
 			if err := b.Set(keyDoc(col.DBID, m.id), stored); err != nil {
 				return err
 			}
-			if err := db.setIndexKeys(b, m.collection, m.id, m.newRaw); err != nil {
+			if err := db.setIndexKeys(b, m.collection, m.id, m.newRaw, m.newDoc); err != nil {
 				return err
 			}
 		case mutationDelete:
-			if err := db.deleteIndexKeys(b, m.collection, m.id, m.oldRaw); err != nil {
+			if err := db.deleteIndexKeys(b, m.collection, m.id, m.oldRaw, m.oldDoc); err != nil {
 				return err
 			}
 			if col != nil {
@@ -2323,14 +2565,15 @@ func (db *DB) dropIndexesDataAndCommitLocked(indexes []indexState) error {
 	return b.Commit()
 }
 
-func (db *DB) deleteIndexKeys(b StorageBatch, collection string, id int64, raw []byte) error {
+func (db *DB) deleteIndexKeys(b StorageBatch, collection string, id int64, raw []byte, doc any) error {
 	col := db.state.Collections[collection]
 	if col == nil || len(raw) == 0 {
 		return nil
 	}
-	var doc any
-	if err := decodeJSONDocument(raw, &doc); err != nil {
-		return err
+	if doc == nil {
+		if err := decodeJSONDocument(raw, &doc); err != nil {
+			return err
+		}
 	}
 	for _, idx := range col.Indexes {
 		for _, value := range valuesForIndex(doc, idx.Path, idx.Kind) {
@@ -2346,14 +2589,15 @@ func (db *DB) deleteIndexKeys(b StorageBatch, collection string, id int64, raw [
 	return nil
 }
 
-func (db *DB) setIndexKeys(b StorageBatch, collection string, id int64, raw []byte) error {
+func (db *DB) setIndexKeys(b StorageBatch, collection string, id int64, raw []byte, doc any) error {
 	col := db.state.Collections[collection]
 	if col == nil || len(raw) == 0 {
 		return nil
 	}
-	var doc any
-	if err := decodeJSONDocument(raw, &doc); err != nil {
-		return err
+	if doc == nil {
+		if err := decodeJSONDocument(raw, &doc); err != nil {
+			return err
+		}
 	}
 	for _, idx := range col.Indexes {
 		for _, value := range valuesForIndex(doc, idx.Path, idx.Kind) {
