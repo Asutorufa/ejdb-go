@@ -3,13 +3,13 @@ package ejdb
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 var keyMetaState = []byte("meta/state")
@@ -299,7 +299,7 @@ func stateFromCatalog(cat catalogState) *dbState {
 			Name:    name,
 			DBID:    c.DBID,
 			NextID:  c.NextID,
-			Docs:    make(map[int64]json.RawMessage),
+			Docs:    make(map[int64]jsontext.Value),
 			Indexes: idx,
 			runtime: make(map[string]*indexRuntime),
 		}
@@ -312,12 +312,12 @@ func unixNanoUTC(v int64) time.Time {
 }
 
 func encodeCatalog(s *dbState) ([]byte, error) {
-	return json.Marshal(catalogFromState(s))
+	return marshalJSON(catalogFromState(s))
 }
 
 func decodeCatalog(raw []byte) (*dbState, error) {
 	var cat catalogState
-	if err := json.Unmarshal(raw, &cat); err != nil {
+	if err := unmarshalJSON(raw, &cat); err != nil {
 		return nil, err
 	}
 	if cat.FormatVersion != currentFormatVersion {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -10,6 +9,8 @@ import (
 	"strings"
 
 	ejdb "github.com/Asutorufa/ejdb-go"
+	json "github.com/go-json-experiment/json"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 func main() {
@@ -104,7 +105,7 @@ func main() {
 
 	meta, err := db.Meta()
 	must(err)
-	mb, _ := json.MarshalIndent(meta, "", "  ")
+	mb, _ := marshalIndent(meta, "", "  ")
 	fmt.Println("\nmeta:")
 	fmt.Println(string(mb))
 
@@ -132,11 +133,29 @@ func pretty(raw []byte) []byte {
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return raw
 	}
-	b, err := json.MarshalIndent(v, "", "  ")
+	b, err := marshalIndent(v, "", "  ")
 	if err != nil {
 		return raw
 	}
 	return b
+}
+
+func marshalIndent(v any, prefix, indent string) ([]byte, error) {
+	b, err := json.Marshal(v,
+		json.Deterministic(true),
+		json.FormatNilMapAsNull(true),
+		json.FormatNilSliceAsNull(true),
+		jsontext.AllowDuplicateNames(true),
+		jsontext.AllowInvalidUTF8(true),
+	)
+	if err != nil {
+		return nil, err
+	}
+	out := jsontext.Value(b)
+	if err := out.Indent(jsontext.WithIndentPrefix(prefix), jsontext.WithIndent(indent)); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func must(err error) {

@@ -1,7 +1,6 @@
 package ejdb
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -11,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 type DB struct {
@@ -39,8 +40,8 @@ type storageMutation struct {
 	kind       storageMutationKind
 	collection string
 	id         int64
-	oldRaw     json.RawMessage
-	newRaw     json.RawMessage
+	oldRaw     jsontext.Value
+	newRaw     jsontext.Value
 }
 
 func Open(opts Options) (*DB, error) {
@@ -107,7 +108,7 @@ func (db *DB) prepareState() {
 	for name, c := range db.state.Collections {
 		c.Name = name
 		if c.Docs == nil {
-			c.Docs = make(map[int64]json.RawMessage)
+			c.Docs = make(map[int64]jsontext.Value)
 		}
 		if c.Indexes == nil {
 			c.Indexes = make(map[string]indexState)
@@ -252,7 +253,7 @@ func (db *DB) Put(collection string, id int64, raw []byte) error {
 	return db.commitLocked()
 }
 
-func (db *DB) Get(collection string, id int64) (json.RawMessage, error) {
+func (db *DB) Get(collection string, id int64) (jsontext.Value, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
@@ -266,7 +267,7 @@ func (db *DB) Get(collection string, id int64) (json.RawMessage, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return append(json.RawMessage(nil), raw...), nil
+	return append(jsontext.Value(nil), raw...), nil
 }
 
 func (db *DB) Delete(collection string, id int64) error {
@@ -350,18 +351,21 @@ func (db *DB) EnsureIndex(collection, path string, kind IndexKind, unique bool) 
 	if db.closed {
 		return ErrClosed
 	}
-	if path == "" || path[0] != '/' {
-		return withCodef(CodeInvalidQuery, "index path must be JSON pointer, got %q", path)
-	}
-	if kind != IndexString && kind != IndexInt64 && kind != IndexFloat {
-		return withCodef(CodeInvalidQuery, "unsupported index kind: %q", kind)
+	if err := validateIndexDefinition(path, kind); err != nil {
+		return err
 	}
 	col := db.ensureCollectionLocked(collection)
-	k := indexKey(path, kind, unique)
-	if _, ok := col.Indexes[k]; ok {
-		return nil
+	for _, idx := range col.Indexes {
+		if idx.Path == path && idx.Kind == kind {
+			if idx.Unique != unique {
+				return withCodef(CodeMismatchedIndexUniqueness, "index %s %s exists with different uniqueness mode", path, kind)
+			}
+			return nil
+		}
 	}
-	idx := indexState{Path: path, Kind: kind, Unique: unique}
+	k := indexKey(path, kind, unique)
+	nextDBID := db.state.NextCollectionID + 1
+	idx := indexState{Path: path, Kind: kind, Unique: unique, DBID: nextDBID}
 	col.Indexes[k] = idx
 	if col.runtime == nil {
 		col.runtime = make(map[string]*indexRuntime)
@@ -372,6 +376,7 @@ func (db *DB) EnsureIndex(collection, path string, kind IndexKind, unique bool) 
 		delete(col.runtime, k)
 		return err
 	}
+	db.state.NextCollectionID = nextDBID
 	db.markFullDirty()
 	return db.commitLocked()
 }
@@ -410,11 +415,46 @@ func (db *DB) RemoveIndex(collection, path string, kind IndexKind) error {
 }
 
 func (db *DB) RemoveIndexMode(collection, path string, mode IndexMode) error {
-	kind, _, err := indexModeParts(mode)
+	kind, unique, err := indexModeParts(mode)
 	if err != nil {
 		return err
 	}
-	return db.RemoveIndex(collection, path, kind)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrClosed
+	}
+	col, ok := db.state.Collections[collection]
+	if !ok {
+		return nil
+	}
+	k := indexKey(path, kind, unique)
+	if _, ok := col.Indexes[k]; !ok {
+		return ErrIndexNotFound
+	}
+	delete(col.Indexes, k)
+	delete(col.runtime, k)
+	db.markFullDirty()
+	return db.commitLocked()
+}
+
+func validateIndexDefinition(path string, kind IndexKind) error {
+	if path == "" || path[0] != '/' {
+		return withCodef(CodeInvalidIndexMode, "index path must be JSON pointer, got %q", path)
+	}
+	if kind != IndexString && kind != IndexInt64 && kind != IndexFloat {
+		return withCodef(CodeInvalidIndexMode, "unsupported index kind: %q", kind)
+	}
+	tokens, err := pointerTokens(path)
+	if err != nil {
+		return withCodef(CodeInvalidIndexMode, "%v", err)
+	}
+	for _, tok := range tokens {
+		if tok == "*" || tok == "**" {
+			return withCodef(CodeInvalidIndexMode, "index path must not contain wildcard token: %s", path)
+		}
+	}
+	return nil
 }
 
 type ExecVisitor func(doc Document, step *int64) error
@@ -437,7 +477,7 @@ const (
 
 type matchedDoc struct {
 	id          int64
-	raw         json.RawMessage
+	raw         jsontext.Value
 	node        any
 	sortValues  []any
 	spillOffset int64
@@ -719,7 +759,7 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			return nil, 0, false, err
 		}
 		if matches {
-			m := matchedDoc{id: id, raw: append(json.RawMessage(nil), raw...), node: node}
+			m := matchedDoc{id: id, raw: append(jsontext.Value(nil), raw...), node: node}
 			if willSort {
 				m.sortValues = make([]any, len(sortPaths))
 				for i, path := range sortPaths {
@@ -828,6 +868,12 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 			changed = true
 		}
 	}
+	if pq.count {
+		if pq.action != actionNone || mode == modeUpdate {
+			return nil, affectedCount, changed, nil
+		}
+		return nil, int64(len(window)), changed, nil
+	}
 
 	docs := make([]Document, 0, len(window))
 	for _, m := range window {
@@ -881,7 +927,7 @@ func (db *DB) canUseStorageQuery(state *dbState) bool {
 	return state == db.state && len(db.pending) == 0 && !db.dirtyFull
 }
 
-func (db *DB) docForQuery(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (json.RawMessage, any, bool, error) {
+func (db *DB) docForQuery(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (jsontext.Value, any, bool, error) {
 	if useStorage {
 		stored, err := reader.Get(keyDoc(collection, id))
 		if err != nil {
@@ -904,7 +950,7 @@ func (db *DB) docForQuery(reader queryReader, col *collectionState, collection s
 	if err := decodeJSONDocument(raw, &node); err != nil {
 		return nil, nil, false, err
 	}
-	return append(json.RawMessage(nil), raw...), node, true, nil
+	return append(jsontext.Value(nil), raw...), node, true, nil
 }
 
 func (db *DB) scanDocumentIDs(reader queryReader, collection string) ([]int64, error) {
@@ -1486,7 +1532,7 @@ func (db *DB) applyActionLocked(state *dbState, col *collectionState, q *Query, 
 			return 0, err
 		}
 		if len(window) == 0 {
-			raw, err := json.Marshal(payload)
+			raw, err := marshalJSON(payload)
 			if err != nil {
 				return 0, err
 			}
@@ -1516,7 +1562,7 @@ func (db *DB) applyActionLocked(state *dbState, col *collectionState, q *Query, 
 }
 
 func applyPatchPayload(raw []byte, payload any) ([]byte, error) {
-	patch, err := json.Marshal(payload)
+	patch, err := marshalJSON(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1574,7 +1620,7 @@ func (db *DB) applyProjectionLocked(state *dbState, q *Query, raw []byte, spec *
 			}
 		}
 	}
-	return json.Marshal(out)
+	return marshalJSON(out)
 }
 
 func (db *DB) joinValueLocked(state *dbState, coll string, v any) (any, error) {
@@ -1620,12 +1666,12 @@ func (db *DB) joinValueLocked(state *dbState, coll string, v any) (any, error) {
 }
 
 func cloneAny(v any) (any, error) {
-	b, err := json.Marshal(v)
+	b, err := marshalJSON(v)
 	if err != nil {
 		return nil, err
 	}
 	var out any
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := unmarshalJSON(b, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -1652,7 +1698,7 @@ func (db *DB) ensureCollectionOnStateLocked(state *dbState, name string) *collec
 		return col
 	}
 	state.NextCollectionID++
-	col := &collectionState{Name: name, DBID: state.NextCollectionID, NextID: 0, Docs: make(map[int64]json.RawMessage), Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
+	col := &collectionState{Name: name, DBID: state.NextCollectionID, NextID: 0, Docs: make(map[int64]jsontext.Value), Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
 	state.Collections[name] = col
 	return col
 }
@@ -1662,9 +1708,9 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 	if err != nil {
 		return err
 	}
-	var oldRaw json.RawMessage
+	var oldRaw jsontext.Value
 	if old, ok := col.Docs[id]; ok {
-		oldRaw = append(json.RawMessage(nil), old...)
+		oldRaw = append(jsontext.Value(nil), old...)
 		var oldDoc any
 		if err := decodeJSONDocument(old, &oldDoc); err != nil {
 			return err
@@ -1685,12 +1731,12 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 	return nil
 }
 
-func normalizeRawJSON(raw []byte) (json.RawMessage, any, error) {
+func normalizeRawJSON(raw []byte) (jsontext.Value, any, error) {
 	var doc any
 	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return nil, nil, err
 	}
-	canon, err := json.Marshal(doc)
+	canon, err := marshalJSON(doc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1706,9 +1752,12 @@ func (db *DB) encodeStoredRaw(raw []byte) ([]byte, error) {
 }
 
 func decodeJSONDocument(raw []byte, out *any) error {
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.UseNumber()
-	return dec.Decode(out)
+	v, err := decodeJSONAny(raw)
+	if err != nil {
+		return err
+	}
+	*out = v
+	return nil
 }
 
 func (db *DB) rebuildAllIndexes() error {
@@ -1832,11 +1881,7 @@ func valuesForIndex(doc any, path string, kind IndexKind) []string {
 func normalizeIndexValue(v any, kind IndexKind) (string, bool) {
 	switch kind {
 	case IndexString:
-		s, ok := v.(string)
-		if !ok {
-			return "", false
-		}
-		return s, true
+		return normalizeStringIndexValue(v)
 	case IndexInt64:
 		i, ok := toInt64(v)
 		if !ok {
@@ -1849,6 +1894,41 @@ func normalizeIndexValue(v any, kind IndexKind) (string, bool) {
 			return "", false
 		}
 		return encodeF64IndexKey(f), true
+	default:
+		return "", false
+	}
+}
+
+func normalizeStringIndexValue(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case jsonNumber:
+		return x.String(), true
+	case float64:
+		return formatJQFloat(x), true
+	case float32:
+		return formatJQFloat(float64(x)), true
+	case int:
+		return strconv.FormatInt(int64(x), 10), true
+	case int64:
+		return strconv.FormatInt(x, 10), true
+	case int32:
+		return strconv.FormatInt(int64(x), 10), true
+	case int16:
+		return strconv.FormatInt(int64(x), 10), true
+	case int8:
+		return strconv.FormatInt(int64(x), 10), true
+	case uint:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint64:
+		return strconv.FormatUint(x, 10), true
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint16:
+		return strconv.FormatUint(uint64(x), 10), true
+	case uint8:
+		return strconv.FormatUint(uint64(x), 10), true
 	default:
 		return "", false
 	}
@@ -1918,23 +1998,23 @@ func (db *DB) markFullDirty() {
 	db.dirtyMeta = true
 }
 
-func (db *DB) recordDocPut(collection string, id int64, oldRaw, newRaw json.RawMessage) {
+func (db *DB) recordDocPut(collection string, id int64, oldRaw, newRaw jsontext.Value) {
 	db.pending = append(db.pending, storageMutation{
 		kind:       mutationPut,
 		collection: collection,
 		id:         id,
-		oldRaw:     append(json.RawMessage(nil), oldRaw...),
-		newRaw:     append(json.RawMessage(nil), newRaw...),
+		oldRaw:     append(jsontext.Value(nil), oldRaw...),
+		newRaw:     append(jsontext.Value(nil), newRaw...),
 	})
 	db.dirtyMeta = true
 }
 
-func (db *DB) recordDocDelete(collection string, id int64, oldRaw json.RawMessage) {
+func (db *DB) recordDocDelete(collection string, id int64, oldRaw jsontext.Value) {
 	db.pending = append(db.pending, storageMutation{
 		kind:       mutationDelete,
 		collection: collection,
 		id:         id,
-		oldRaw:     append(json.RawMessage(nil), oldRaw...),
+		oldRaw:     append(jsontext.Value(nil), oldRaw...),
 	})
 	db.dirtyMeta = true
 }

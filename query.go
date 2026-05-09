@@ -1,7 +1,6 @@
 package ejdb
 
 import (
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -1728,9 +1727,12 @@ func parseValueExpr(s string, ctx *parseContext) (valueExpr, error) {
 }
 
 func decodeJSONValue(raw []byte, v *any) error {
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.UseNumber()
-	return dec.Decode(v)
+	out, err := decodeJSONAny(raw)
+	if err != nil {
+		return err
+	}
+	*v = out
+	return nil
 }
 
 func unquoteSingleJQL(s string) string {
@@ -2506,8 +2508,8 @@ func equalValue(a, b any) bool {
 			}
 		}
 	}
-	ab, _ := json.Marshal(a)
-	bb, _ := json.Marshal(b)
+	ab, _ := marshalJSON(a)
+	bb, _ := marshalJSON(b)
 	return string(ab) == string(bb)
 }
 
@@ -2565,8 +2567,13 @@ func toFloat64(v any) (float64, bool) {
 		return float64(x), true
 	case uint8:
 		return float64(x), true
-	case json.Number:
+	case jsonNumber:
 		f, err := x.Float64()
+		if err == nil {
+			return f, true
+		}
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
 		if err == nil {
 			return f, true
 		}
@@ -2596,8 +2603,13 @@ func toInt64(v any) (int64, bool) {
 			return 0, false
 		}
 		return int64(x), true
-	case json.Number:
+	case jsonNumber:
 		i, err := x.Int64()
+		if err == nil {
+			return i, true
+		}
+	case string:
+		i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
 		if err == nil {
 			return i, true
 		}
@@ -2654,7 +2666,7 @@ func toAnySlice(v any) ([]any, bool) {
 			out[i] = v
 		}
 		return out, true
-	case []json.Number:
+	case []jsonNumber:
 		out := make([]any, len(x))
 		for i, v := range x {
 			out[i] = v

@@ -1,7 +1,6 @@
 package ejdb
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -132,7 +131,7 @@ func formatValueExpr(v valueExpr) string {
 }
 
 func formatLiteral(v any) string {
-	b, err := json.Marshal(v)
+	b, err := marshalJSON(v)
 	if err != nil {
 		return fmt.Sprint(v)
 	}

@@ -1,8 +1,11 @@
 module github.com/Asutorufa/ejdb-go
 
-go 1.23
+go 1.26
 
-require github.com/cockroachdb/pebble v1.1.5
+require (
+	github.com/cockroachdb/pebble v1.1.5
+	github.com/go-json-experiment/json v0.0.0-20260505212615-e40f80bf6836
+)
 
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect

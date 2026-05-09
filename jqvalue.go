@@ -1,7 +1,6 @@
 package ejdb
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -35,7 +34,7 @@ func toJQValue(v any) jqValue {
 		return jqValue{kind: jqString, raw: x}
 	case regexpExpr:
 		return jqValue{kind: jqString, raw: string(x)}
-	case json.Number:
+	case jsonNumber:
 		if i, err := x.Int64(); err == nil {
 			return jqValue{kind: jqI64, raw: i}
 		}

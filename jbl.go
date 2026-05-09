@@ -2,11 +2,12 @@ package ejdb
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"io"
 	"math"
 	"sort"
 	"strconv"
+
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 const (
@@ -86,7 +87,7 @@ func encodeStoredDocument(doc any) ([]byte, error) {
 	}
 }
 
-func decodeStoredDocument(raw []byte) (json.RawMessage, any, error) {
+func decodeStoredDocument(raw []byte) (jsontext.Value, any, error) {
 	if !isJBLDocument(raw) {
 		return nil, nil, withCode(CodeIncompatibleFormat, "stored document is not a JBL/Binn document")
 	}
@@ -98,11 +99,11 @@ func decodeStoredDocument(raw []byte) (json.RawMessage, any, error) {
 	if dec.off != len(dec.buf) {
 		return nil, nil, withCode(CodeIncompatibleFormat, "stored document has trailing JBL/Binn bytes")
 	}
-	canon, err := json.Marshal(v)
+	canon, err := marshalJSON(v)
 	if err != nil {
 		return nil, nil, err
 	}
-	return json.RawMessage(canon), v, nil
+	return jsontext.Value(canon), v, nil
 }
 
 func isJBLDocument(raw []byte) bool {
@@ -128,7 +129,7 @@ func binnEncodeValue(v any) ([]byte, error) {
 		return appendBinnBlob(nil, int(binnBlob), []byte(x)), nil
 	case binnTypedValue:
 		return binnEncodeTypedValue(x)
-	case json.Number:
+	case jsonNumber:
 		if i, err := x.Int64(); err == nil {
 			return binnEncodeInt(i), nil
 		}
@@ -381,34 +382,34 @@ func (d *binnDecoder) value() (any, error) {
 		return false, nil
 	case int(binnUint8):
 		v, err := d.byte()
-		return json.Number(strconv.FormatUint(uint64(v), 10)), err
+		return jsonNumber(strconv.FormatUint(uint64(v), 10)), err
 	case int(binnInt8):
 		v, err := d.byte()
-		return json.Number(strconv.FormatInt(int64(int8(v)), 10)), err
+		return jsonNumber(strconv.FormatInt(int64(int8(v)), 10)), err
 	case int(binnUint16):
 		v, err := d.u16()
-		return json.Number(strconv.FormatUint(uint64(v), 10)), err
+		return jsonNumber(strconv.FormatUint(uint64(v), 10)), err
 	case int(binnInt16):
 		v, err := d.u16()
-		return json.Number(strconv.FormatInt(int64(int16(v)), 10)), err
+		return jsonNumber(strconv.FormatInt(int64(int16(v)), 10)), err
 	case int(binnUint32):
 		v, err := d.u32()
-		return json.Number(strconv.FormatUint(uint64(v), 10)), err
+		return jsonNumber(strconv.FormatUint(uint64(v), 10)), err
 	case int(binnInt32):
 		v, err := d.u32()
-		return json.Number(strconv.FormatInt(int64(int32(v)), 10)), err
+		return jsonNumber(strconv.FormatInt(int64(int32(v)), 10)), err
 	case int(binnUint64):
 		v, err := d.u64()
-		return json.Number(strconv.FormatUint(v, 10)), err
+		return jsonNumber(strconv.FormatUint(v, 10)), err
 	case int(binnInt64), int(binnCurrency):
 		v, err := d.u64()
-		return json.Number(strconv.FormatInt(int64(v), 10)), err
+		return jsonNumber(strconv.FormatInt(int64(v), 10)), err
 	case int(binnFloat32):
 		v, err := d.u32()
-		return json.Number(strconv.FormatFloat(float64(math.Float32frombits(v)), 'g', -1, 32)), err
+		return jsonNumber(strconv.FormatFloat(float64(math.Float32frombits(v)), 'g', -1, 32)), err
 	case int(binnFloat64):
 		v, err := d.u64()
-		return json.Number(strconv.FormatFloat(math.Float64frombits(v), 'g', -1, 64)), err
+		return jsonNumber(strconv.FormatFloat(math.Float64frombits(v), 'g', -1, 64)), err
 	case int(binnString), int(binnDateTime), int(binnDate), int(binnTime), int(binnDecimal), int(binnCurrencyStr), int(binnSingleStr), int(binnDoubleStr), binnHTML, binnXML, binnJSON, binnJavaScript, binnCSS:
 		v, err := d.string()
 		return v, err

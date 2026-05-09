@@ -1,13 +1,13 @@
 package ejdb
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 type IndexKind string
@@ -44,9 +44,25 @@ func indexModeParts(mode IndexMode) (IndexKind, bool, error) {
 		kind = IndexFloat
 	}
 	if kinds != 1 {
-		return "", false, withCodef(CodeInvalidQuery, "index mode must include exactly one type bit: %d", mode)
+		return "", false, withCodef(CodeInvalidIndexMode, "index mode must include exactly one type bit: %d", mode)
 	}
 	return kind, unique, nil
+}
+
+func indexMode(kind IndexKind, unique bool) IndexMode {
+	var mode IndexMode
+	if unique {
+		mode |= IdxUnique
+	}
+	switch kind {
+	case IndexString:
+		mode |= IdxString
+	case IndexInt64:
+		mode |= IdxInt64
+	case IndexFloat:
+		mode |= IdxFloat
+	}
+	return mode
 }
 
 type Options struct {
@@ -59,14 +75,18 @@ type Options struct {
 }
 
 type Document struct {
-	ID  int64           `json:"id"`
-	Raw json.RawMessage `json:"raw"`
+	ID  int64          `json:"id"`
+	Raw jsontext.Value `json:"raw"`
 }
 
 type IndexMeta struct {
 	Path   string    `json:"ptr"`
 	Kind   IndexKind `json:"kind"`
 	Unique bool      `json:"unique"`
+	Mode   IndexMode `json:"mode"`
+	DBID   int64     `json:"dbid"`
+	RNum   int       `json:"rnum"`
+	IDBF   int       `json:"idbf"`
 }
 
 type CollectionMeta struct {
@@ -91,18 +111,19 @@ type dbState struct {
 }
 
 type collectionState struct {
-	Name    string                    `json:"-"`
-	DBID    int64                     `json:"dbid"`
-	NextID  int64                     `json:"next_id"`
-	Docs    map[int64]json.RawMessage `json:"docs"`
-	Indexes map[string]indexState     `json:"indexes"`
-	runtime map[string]*indexRuntime  `json:"-"`
+	Name    string                   `json:"-"`
+	DBID    int64                    `json:"dbid"`
+	NextID  int64                    `json:"next_id"`
+	Docs    map[int64]jsontext.Value `json:"docs"`
+	Indexes map[string]indexState    `json:"indexes"`
+	runtime map[string]*indexRuntime `json:"-"`
 }
 
 type indexState struct {
 	Path   string    `json:"path"`
 	Kind   IndexKind `json:"kind"`
 	Unique bool      `json:"unique"`
+	DBID   int64     `json:"dbid,omitempty"`
 }
 
 type indexRuntime struct {
@@ -139,12 +160,12 @@ func (c *collectionState) initRuntime() {
 }
 
 func (s *dbState) clone() (*dbState, error) {
-	b, err := json.Marshal(s)
+	b, err := marshalJSON(s)
 	if err != nil {
 		return nil, err
 	}
 	var out dbState
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := unmarshalJSON(b, &out); err != nil {
 		return nil, err
 	}
 	if out.Collections == nil {
@@ -153,7 +174,7 @@ func (s *dbState) clone() (*dbState, error) {
 	for name, c := range out.Collections {
 		c.Name = name
 		if c.Docs == nil {
-			c.Docs = make(map[int64]json.RawMessage)
+			c.Docs = make(map[int64]jsontext.Value)
 		}
 		if c.Indexes == nil {
 			c.Indexes = make(map[string]indexState)
@@ -183,8 +204,16 @@ func toMeta(path string, state *dbState) Meta {
 			DBID: c.DBID,
 			RNum: len(c.Docs),
 		}
-		for _, idx := range c.Indexes {
-			cm.Indexes = append(cm.Indexes, IndexMeta{Path: idx.Path, Kind: idx.Kind, Unique: idx.Unique})
+		for k, idx := range c.Indexes {
+			cm.Indexes = append(cm.Indexes, IndexMeta{
+				Path:   idx.Path,
+				Kind:   idx.Kind,
+				Unique: idx.Unique,
+				Mode:   indexMode(idx.Kind, idx.Unique),
+				DBID:   idx.DBID,
+				RNum:   indexRuntimeRNum(c.runtime[k]),
+				IDBF:   indexIDBF(idx),
+			})
 		}
 		sort.Slice(cm.Indexes, func(i, j int) bool {
 			if cm.Indexes[i].Path == cm.Indexes[j].Path {
@@ -198,4 +227,25 @@ func toMeta(path string, state *dbState) Meta {
 		m.Collections = append(m.Collections, cm)
 	}
 	return m
+}
+
+func indexRuntimeRNum(rt *indexRuntime) int {
+	if rt == nil {
+		return 0
+	}
+	if rt.def.Unique {
+		return len(rt.unique)
+	}
+	n := 0
+	for _, ids := range rt.multi {
+		n += len(ids)
+	}
+	return n
+}
+
+func indexIDBF(idx indexState) int {
+	if idx.Unique {
+		return 2
+	}
+	return 8
 }

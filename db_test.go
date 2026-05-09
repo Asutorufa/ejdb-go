@@ -2,7 +2,6 @@ package ejdb
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	json "github.com/go-json-experiment/json"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 func mustOpen(t *testing.T, path string) *DB {
@@ -175,7 +177,7 @@ func TestOfficialEmbeddedMetaIndexRemoveAndPatch(t *testing.T) {
 	if err := db.RemoveIndexMode("col1", "/foo/baz", IdxString); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RemoveIndexMode("col1", "/foo/gaz", IdxString); err != nil {
+	if err := db.RemoveIndexMode("col1", "/foo/gaz", IdxUnique|IdxString); err != nil {
 		t.Fatal(err)
 	}
 	meta, err = db.Meta()
@@ -231,7 +233,7 @@ func TestDocumentsPersistAsJBLBinnBinary(t *testing.T) {
 	if stored[0] != binnObject {
 		t.Fatalf("expected JBL/Binn object root, got 0x%x", stored[0])
 	}
-	if json.Valid(stored) {
+	if jsontext.Value(stored).IsValid(jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)) {
 		t.Fatalf("document value should not be stored as JSON: %s", stored)
 	}
 	raw, _, err := decodeStoredDocument(stored)
@@ -321,15 +323,15 @@ func TestJBLBinnOfficialTypeCoverage(t *testing.T) {
 		{"null", nil, nil},
 		{"true", true, true},
 		{"false", false, false},
-		{"int8", int8(-7), json.Number("-7")},
-		{"uint8", uint8(7), json.Number("7")},
-		{"int16", int16(-32000), json.Number("-32000")},
-		{"uint16", uint16(65000), json.Number("65000")},
-		{"int32", int32(-70000), json.Number("-70000")},
-		{"uint32", uint32(70000), json.Number("70000")},
-		{"int64", int64(-5000000000), json.Number("-5000000000")},
-		{"float32", float32(1.25), json.Number("1.25")},
-		{"float64", 2.5, json.Number("2.5")},
+		{"int8", int8(-7), jsonNumber("-7")},
+		{"uint8", uint8(7), jsonNumber("7")},
+		{"int16", int16(-32000), jsonNumber("-32000")},
+		{"uint16", uint16(65000), jsonNumber("65000")},
+		{"int32", int32(-70000), jsonNumber("-70000")},
+		{"uint32", uint32(70000), jsonNumber("70000")},
+		{"int64", int64(-5000000000), jsonNumber("-5000000000")},
+		{"float32", float32(1.25), jsonNumber("1.25")},
+		{"float64", 2.5, jsonNumber("2.5")},
 		{"string", "hello", "hello"},
 		{"datetime", binnTypedValue{Type: int(binnDateTime), Value: "2026-05-09 10:11:12"}, "2026-05-09 10:11:12"},
 		{"date", binnTypedValue{Type: int(binnDate), Value: "2026-05-09"}, "2026-05-09"},
@@ -1593,4 +1595,120 @@ func TestOfficialJQLProjectionPlaceholderTypes(t *testing.T) {
 		t.Fatalf("docs=%d", len(docs))
 	}
 	assertJSONEqual(t, docs[0].Raw, `{"foo":1,"baz":3}`)
+}
+
+func TestOfficialCompatibilityCountPatchIDsIndexesAndMeta(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	artistID, err := db.PutNew("artists", []byte(`{"name":"Ada"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PutNew("paintings", []byte(`{"artist":"1","n":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if artistID != 1 {
+		t.Fatalf("artist id=%d", artistID)
+	}
+
+	qPK := mustQuery(t, "", "@artists/=:id")
+	if err := qPK.SetString("id", 0, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if docs := mustList(t, db, qPK); len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("string pk got %+v", docs)
+	}
+	if docs := mustList(t, db, mustQuery(t, "", `@artists/=["1"]`)); len(docs) != 1 || docs[0].ID != 1 {
+		t.Fatalf("string pk array got %+v", docs)
+	}
+	if docs := mustList(t, db, mustQuery(t, "paintings", `/* | /artist<artists`)); len(docs) != 1 {
+		t.Fatalf("join docs=%+v", docs)
+	} else {
+		assertJSONEqual(t, docs[0].Raw, `{"artist":{"name":"Ada"}}`)
+	}
+
+	for _, raw := range []string{`{"v":1}`, `{"v":2}`, `{"v":3}`} {
+		if _, err := db.PutNew("items", []byte(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	qCount := mustQuery(t, "items", "/* | count")
+	visited := 0
+	cnt, err := db.Exec(qCount, &ExecOptions{Visitor: func(Document, *int64) error {
+		visited++
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 3 || visited != 0 {
+		t.Fatalf("count exec cnt=%d visited=%d", cnt, visited)
+	}
+	if docs, err := db.ListQuery(qCount, 0); err != nil || len(docs) != 0 {
+		t.Fatalf("count list docs=%+v err=%v", docs, err)
+	}
+	if cnt, err := db.Count(qCount, 0); err != nil || cnt != 3 {
+		t.Fatalf("count count cnt=%d err=%v", cnt, err)
+	}
+
+	patchID, err := db.PutNew("patches", []byte(`{"foo":{"bar":1},"arr":["bar"],"baz":{"gaz":11},"pets":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Patch("patches", patchID, []byte(`[{"op":"increment","path":"/foo/bar","value":2},{"op":"add_create","path":"/foo/zaz/gaz","value":22},{"op":"add","path":"/pets/-","value":{"name":"Neo"}},{"op":"swap","from":"/arr/0","path":"/baz/gaz"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Get("patches", patchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, got, `{"foo":{"bar":3,"zaz":{"gaz":22}},"arr":[11],"baz":{"gaz":"bar"},"pets":[{"name":"Neo"}]}`)
+	if err := db.Patch("patches", patchID, []byte(`[{"op":"add","path":"/missing/path","value":1}]`)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected standard add missing parent error, got %v", err)
+	}
+	if err := db.Patch("patches", patchID, []byte(`[{"op":"swap","from":"/arr/0","path":"/baz/zaz"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = db.Get("patches", patchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, got, `{"foo":{"bar":3,"zaz":{"gaz":22}},"arr":[],"baz":{"gaz":"bar","zaz":11},"pets":[{"name":"Neo"}]}`)
+
+	if err := db.EnsureIndexMode("idx", "/v", IdxUnique|IdxString); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureIndexMode("idx", "/v", IdxString); !errors.Is(err, &Error{Code: CodeMismatchedIndexUniqueness}) {
+		t.Fatalf("expected mismatched uniqueness, got %v", err)
+	}
+	if err := db.EnsureIndexMode("idx", "/bad/*/v", IdxString); !errors.Is(err, &Error{Code: CodeInvalidIndexMode}) {
+		t.Fatalf("expected invalid wildcard index path, got %v", err)
+	}
+	if err := db.EnsureIndexMode("idx", "/n", IdxString); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PutNew("idx", []byte(`{"v":"a","n":42}`)); err != nil {
+		t.Fatal(err)
+	}
+	if docs := mustList(t, db, mustQuery(t, "idx", `/[n = "42"]`)); len(docs) != 1 {
+		t.Fatalf("converted string index docs=%+v", docs)
+	}
+	if err := db.RemoveIndexMode("missing", "/v", IdxString); err != nil {
+		t.Fatalf("remove index missing collection: %v", err)
+	}
+	if err := db.RemoveIndexMode("idx", "/v", IdxUnique|IdxString); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := db.Meta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	col := findMetaCollection(meta, "idx")
+	if col == nil {
+		t.Fatalf("idx collection missing in meta: %+v", meta)
+	}
+	if len(col.Indexes) != 1 || col.Indexes[0].Path != "/n" || col.Indexes[0].Kind != IndexString || col.Indexes[0].Mode != IdxString || col.Indexes[0].RNum != 1 || col.Indexes[0].DBID == 0 || col.Indexes[0].IDBF == 0 {
+		t.Fatalf("unexpected index meta: %+v", col.Indexes)
+	}
 }

@@ -53,6 +53,18 @@ func pointerGet(doc any, ptr string) (any, bool) {
 }
 
 func pointerSet(doc any, ptr string, val any, createMissing bool) error {
+	return pointerSetMode(doc, ptr, val, createMissing, createMissing, false)
+}
+
+func pointerAdd(doc any, ptr string, val any, createParents bool) error {
+	return pointerSetMode(doc, ptr, val, createParents, true, true)
+}
+
+func pointerReplace(doc any, ptr string, val any) error {
+	return pointerSetMode(doc, ptr, val, false, false, false)
+}
+
+func pointerSetMode(doc any, ptr string, val any, createParents, allowLeafCreate, arrayInsert bool) error {
 	tokens, err := pointerTokens(ptr)
 	if err != nil {
 		return err
@@ -60,58 +72,82 @@ func pointerSet(doc any, ptr string, val any, createMissing bool) error {
 	if len(tokens) == 0 {
 		return errors.New("cannot replace document root with pointerSet")
 	}
-	cur := doc
-	for i := 0; i < len(tokens)-1; i++ {
-		t := tokens[i]
+	_, err = setAt(doc, tokens, val, createParents, allowLeafCreate, arrayInsert)
+	return err
+}
+
+func setAt(cur any, tokens []string, val any, createParents, allowLeafCreate, arrayInsert bool) (any, error) {
+	if len(tokens) == 0 {
+		return val, nil
+	}
+	t := tokens[0]
+	if len(tokens) > 1 {
 		switch v := cur.(type) {
 		case map[string]any:
 			n, ok := v[t]
 			if !ok {
-				if !createMissing {
-					return ErrNotFound
+				if !createParents {
+					return cur, ErrNotFound
 				}
 				n = map[string]any{}
-				v[t] = n
 			}
-			cur = n
+			updated, err := setAt(n, tokens[1:], val, createParents, allowLeafCreate, arrayInsert)
+			if err != nil {
+				return cur, err
+			}
+			v[t] = updated
+			return v, nil
 		case []any:
 			idx, err := strconv.Atoi(t)
 			if err != nil || idx < 0 || idx >= len(v) {
-				return ErrNotFound
+				return cur, ErrNotFound
 			}
-			cur = v[idx]
+			updated, err := setAt(v[idx], tokens[1:], val, createParents, allowLeafCreate, arrayInsert)
+			if err != nil {
+				return cur, err
+			}
+			v[idx] = updated
+			return v, nil
 		default:
-			return ErrNotFound
+			return cur, ErrNotFound
 		}
 	}
-	last := tokens[len(tokens)-1]
 	switch v := cur.(type) {
 	case map[string]any:
-		if _, ok := v[last]; !ok && !createMissing {
-			return ErrNotFound
+		if _, ok := v[t]; !ok && !allowLeafCreate {
+			return cur, ErrNotFound
 		}
-		v[last] = val
-		return nil
+		v[t] = val
+		return v, nil
 	case []any:
-		if last == "-" && createMissing {
+		if t == "-" && allowLeafCreate && arrayInsert {
 			v = append(v, val)
-			return nil
+			return v, nil
 		}
-		idx, err := strconv.Atoi(last)
+		idx, err := strconv.Atoi(t)
 		if err != nil || idx < 0 {
-			return ErrNotFound
+			return cur, ErrNotFound
 		}
-		if idx == len(v) && createMissing {
+		if allowLeafCreate && arrayInsert {
+			if idx > len(v) {
+				return cur, ErrNotFound
+			}
+			v = append(v, nil)
+			copy(v[idx+1:], v[idx:])
+			v[idx] = val
+			return v, nil
+		}
+		if idx == len(v) && allowLeafCreate {
 			v = append(v, val)
-			return nil
+			return v, nil
 		}
 		if idx >= len(v) {
-			return ErrNotFound
+			return cur, ErrNotFound
 		}
 		v[idx] = val
-		return nil
+		return v, nil
 	default:
-		return ErrNotFound
+		return cur, ErrNotFound
 	}
 }
 

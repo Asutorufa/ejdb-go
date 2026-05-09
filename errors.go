@@ -8,22 +8,25 @@ import (
 type ErrorCode string
 
 const (
-	CodeClosed             ErrorCode = "EJDB_CLOSED"
-	CodeNotFound           ErrorCode = "EJDB_NOT_FOUND"
-	CodeCollectionExists   ErrorCode = "EJDB_COLLECTION_EXISTS"
-	CodeCollectionAbsent   ErrorCode = "EJDB_COLLECTION_ABSENT"
-	CodeIndexNotFound      ErrorCode = "EJDB_INDEX_NOT_FOUND"
-	CodeUniqueConstraint   ErrorCode = "EJDB_UNIQUE_CONSTRAINT"
-	CodeReadOnlyTx         ErrorCode = "EJDB_READONLY_TX"
-	CodeInvalidQuery       ErrorCode = "EJDB_INVALID_QUERY"
-	CodeInvalidPlaceholder ErrorCode = "JQL_INVALID_PLACEHOLDER"
-	CodeUnsetPlaceholder   ErrorCode = "JQL_UNSET_PLACEHOLDER"
-	CodeNoCollection       ErrorCode = "JQL_NO_COLLECTION"
-	CodeSkipAlreadySet     ErrorCode = "JQL_SKIP_ALREADY_SET"
-	CodeLimitAlreadySet    ErrorCode = "JQL_LIMIT_ALREADY_SET"
-	CodeOrderByMaxLimit    ErrorCode = "JQL_ORDERBY_MAX_LIMIT"
-	CodeInvalidValueType   ErrorCode = "JQL_INVALID_VALUE_TYPE"
-	CodeIncompatibleFormat ErrorCode = "EJDB_INCOMPATIBLE_FORMAT"
+	CodeClosed                    ErrorCode = "EJDB_CLOSED"
+	CodeNotFound                  ErrorCode = "EJDB_NOT_FOUND"
+	CodeCollectionExists          ErrorCode = "EJDB_COLLECTION_EXISTS"
+	CodeCollectionAbsent          ErrorCode = "EJDB_COLLECTION_ABSENT"
+	CodeIndexNotFound             ErrorCode = "EJDB_INDEX_NOT_FOUND"
+	CodeUniqueConstraint          ErrorCode = "EJDB_UNIQUE_CONSTRAINT"
+	CodeReadOnlyTx                ErrorCode = "EJDB_READONLY_TX"
+	CodeInvalidCollection         ErrorCode = "EJDB_INVALID_COLLECTION_NAME"
+	CodeInvalidIndexMode          ErrorCode = "EJDB_INVALID_INDEX_MODE"
+	CodeMismatchedIndexUniqueness ErrorCode = "EJDB_MISMATCHED_INDEX_UNIQUENESS_MODE"
+	CodeInvalidQuery              ErrorCode = "EJDB_INVALID_QUERY"
+	CodeInvalidPlaceholder        ErrorCode = "JQL_INVALID_PLACEHOLDER"
+	CodeUnsetPlaceholder          ErrorCode = "JQL_UNSET_PLACEHOLDER"
+	CodeNoCollection              ErrorCode = "JQL_NO_COLLECTION"
+	CodeSkipAlreadySet            ErrorCode = "JQL_SKIP_ALREADY_SET"
+	CodeLimitAlreadySet           ErrorCode = "JQL_LIMIT_ALREADY_SET"
+	CodeOrderByMaxLimit           ErrorCode = "JQL_ORDERBY_MAX_LIMIT"
+	CodeInvalidValueType          ErrorCode = "JQL_INVALID_VALUE_TYPE"
+	CodeIncompatibleFormat        ErrorCode = "EJDB_INCOMPATIBLE_FORMAT"
 )
 
 type Error struct {
@@ -66,12 +69,14 @@ func CodeOf(err error) (ErrorCode, bool) {
 }
 
 var (
-	ErrNotFound         = &Error{Code: CodeNotFound, Msg: "ejdb: document not found"}
-	ErrCollectionExists = &Error{Code: CodeCollectionExists, Msg: "ejdb: collection already exists"}
-	ErrCollectionAbsent = &Error{Code: CodeCollectionAbsent, Msg: "ejdb: collection does not exist"}
-	ErrIndexNotFound    = &Error{Code: CodeIndexNotFound, Msg: "ejdb: index not found"}
-	ErrUniqueConstraint = &Error{Code: CodeUniqueConstraint, Msg: "ejdb: unique index constraint violated"}
-	ErrClosed           = &Error{Code: CodeClosed, Msg: "ejdb: database is closed"}
-	ErrReadOnlyTx       = &Error{Code: CodeReadOnlyTx, Msg: "ejdb: transaction is read-only"}
-	ErrInvalidQuery     = &Error{Code: CodeInvalidQuery, Msg: "ejdb: invalid query"}
+	ErrNotFound                  = &Error{Code: CodeNotFound, Msg: "ejdb: document not found"}
+	ErrCollectionExists          = &Error{Code: CodeCollectionExists, Msg: "ejdb: collection already exists"}
+	ErrCollectionAbsent          = &Error{Code: CodeCollectionAbsent, Msg: "ejdb: collection does not exist"}
+	ErrIndexNotFound             = &Error{Code: CodeIndexNotFound, Msg: "ejdb: index not found"}
+	ErrUniqueConstraint          = &Error{Code: CodeUniqueConstraint, Msg: "ejdb: unique index constraint violated"}
+	ErrClosed                    = &Error{Code: CodeClosed, Msg: "ejdb: database is closed"}
+	ErrReadOnlyTx                = &Error{Code: CodeReadOnlyTx, Msg: "ejdb: transaction is read-only"}
+	ErrInvalidQuery              = &Error{Code: CodeInvalidQuery, Msg: "ejdb: invalid query"}
+	ErrInvalidIndexMode          = &Error{Code: CodeInvalidIndexMode, Msg: "ejdb: invalid index mode"}
+	ErrMismatchedIndexUniqueness = &Error{Code: CodeMismatchedIndexUniqueness, Msg: "ejdb: mismatched index uniqueness mode"}
 )

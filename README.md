@@ -28,6 +28,7 @@ Documents are accepted and returned as JSON, but persisted as a JBL/Binn-style b
 - Sort overflow files: sorter input spills to a temporary file after `Options.SortBufferSize` bytes, defaulting to 16 MiB
 - Official-like JQL comparison semantics for null, bool, numbers, strings, arrays, and objects
 - JBL/Binn-style binary document persistence with JSON input/output at the public API boundary, including official Binn numeric, string-family, blob-family, list, map, and object type coverage
+- JSON encoding/decoding through `github.com/go-json-experiment/json` and `jsontext.Value` raw values
 - Indexed equality, `in`, range, and string prefix planning
 - Query candidate and order-by index scans read from Pebble snapshot iterators; in-memory index maps are only planner/constraint caches
 - Official-style JQL canonical printer with `Query.Canonical()`
@@ -119,20 +120,20 @@ go test -bench . -benchmem -benchtime=200ms ./...
 
 Sample environment:
 
-- `goos: darwin`
-- `goarch: arm64`
-- `cpu: Apple M4`
+- `goos: linux`
+- `goarch: amd64`
+- `cpu: AMD Ryzen 5 5600G with Radeon Graphics`
 - Command: `go test -bench . -benchmem -benchtime=200ms ./...`
 
 Latest sample:
 
-- `BenchmarkPutNew-10`: `5400 ns/op`, `189433 docs/s`, `189433 ops/s`, `5389 B/op`, `72 allocs/op`
-- `BenchmarkPutNewWriteTx-10`: `2565 ns/op`, `435091 docs/s`, `435091 ops/s`, `5155 B/op`, `62 allocs/op`
-- `BenchmarkGetByID-10`: `32.30 ns/op`, `31716909 docs/s`, `31716909 ops/s`, `31 B/op`, `1 allocs/op`
-- `BenchmarkQueryScanVsIndex/scan-10`: `12753336 ns/op`, `78.41 docs/s`, `78.41 ops/s`, `9612156 B/op`, `269698 allocs/op`
-- `BenchmarkQueryScanVsIndex/indexed-10`: `2995 ns/op`, `333940 docs/s`, `333940 ops/s`, `1491 B/op`, `53 allocs/op`
-- `BenchmarkRangeQuery-10`: `2243202 ns/op`, `45007 docs/s`, `450.1 ops/s`, `1792463 B/op`, `72374 allocs/op`
-- `BenchmarkSortPagination-10`: `14381592 ns/op`, `3529 docs/s`, `70.59 ops/s`, `12212607 B/op`, `271236 allocs/op`
-- `BenchmarkUpdateDelete-10`: `35863 ns/op`, `56848 docs/s`, `28424 ops/s`, `20002 B/op`, `342 allocs/op`
+- `BenchmarkPutNew-12`: `7928 ns/op`, `126291 docs/s`, `126291 ops/s`, `4034 B/op`, `72 allocs/op`
+- `BenchmarkPutNewWriteTx-12`: `4850 ns/op`, `216613 docs/s`, `216613 ops/s`, `3777 B/op`, `62 allocs/op`
+- `BenchmarkGetByID-12`: `58.59 ns/op`, `17075168 docs/s`, `17075168 ops/s`, `31 B/op`, `1 allocs/op`
+- `BenchmarkQueryScanVsIndex/scan-12`: `37160504 ns/op`, `26.91 docs/s`, `26.91 ops/s`, `9541929 B/op`, `319709 allocs/op`
+- `BenchmarkQueryScanVsIndex/indexed-12`: `8262 ns/op`, `121035 docs/s`, `121035 ops/s`, `1486 B/op`, `58 allocs/op`
+- `BenchmarkRangeQuery-12`: `4085015 ns/op`, `24489 docs/s`, `244.9 ops/s`, `1797940 B/op`, `72883 allocs/op`
+- `BenchmarkSortPagination-12`: `38457820 ns/op`, `1301 docs/s`, `26.02 ops/s`, `12220489 B/op`, `321313 allocs/op`
+- `BenchmarkUpdateDelete-12`: `67400 ns/op`, `29680 docs/s`, `14840 ops/s`, `18027 B/op`, `352 allocs/op`
 
 Regular document writes, updates, and deletes use incremental Pebble batches. Structural operations such as collection rename, collection removal, and index rebuild still use a full refresh to keep the implementation simple and reliable.

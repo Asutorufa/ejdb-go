@@ -1,8 +1,7 @@
 package ejdb
 
 import (
-	"encoding/json"
-	"fmt"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 type Tx struct {
@@ -118,7 +117,7 @@ func (tx *Tx) Put(collection string, id int64, raw []byte) error {
 	return tx.db.putLocked(col, id, raw)
 }
 
-func (tx *Tx) Get(collection string, id int64) (json.RawMessage, error) {
+func (tx *Tx) Get(collection string, id int64) (jsontext.Value, error) {
 	col, ok := tx.state.Collections[collection]
 	if !ok {
 		return nil, ErrNotFound
@@ -127,7 +126,7 @@ func (tx *Tx) Get(collection string, id int64) (json.RawMessage, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return append(json.RawMessage(nil), raw...), nil
+	return append(jsontext.Value(nil), raw...), nil
 }
 
 func (tx *Tx) Delete(collection string, id int64) error {
@@ -194,18 +193,21 @@ func (tx *Tx) EnsureIndex(collection, path string, kind IndexKind, unique bool) 
 	if !tx.write {
 		return ErrReadOnlyTx
 	}
-	if path == "" || path[0] != '/' {
-		return fmt.Errorf("index path must be JSON pointer, got %q", path)
-	}
-	if kind != IndexString && kind != IndexInt64 && kind != IndexFloat {
-		return fmt.Errorf("unsupported index kind: %q", kind)
+	if err := validateIndexDefinition(path, kind); err != nil {
+		return err
 	}
 	col := tx.ensureCollection(collection)
-	k := indexKey(path, kind, unique)
-	if _, ok := col.Indexes[k]; ok {
-		return nil
+	for _, idx := range col.Indexes {
+		if idx.Path == path && idx.Kind == kind {
+			if idx.Unique != unique {
+				return withCodef(CodeMismatchedIndexUniqueness, "index %s %s exists with different uniqueness mode", path, kind)
+			}
+			return nil
+		}
 	}
-	idx := indexState{Path: path, Kind: kind, Unique: unique}
+	k := indexKey(path, kind, unique)
+	nextDBID := tx.state.NextCollectionID + 1
+	idx := indexState{Path: path, Kind: kind, Unique: unique, DBID: nextDBID}
 	col.Indexes[k] = idx
 	if col.runtime == nil {
 		col.runtime = make(map[string]*indexRuntime)
@@ -216,6 +218,7 @@ func (tx *Tx) EnsureIndex(collection, path string, kind IndexKind, unique bool) 
 		delete(col.runtime, k)
 		return err
 	}
+	tx.state.NextCollectionID = nextDBID
 	tx.db.markFullDirty()
 	return nil
 }
@@ -252,11 +255,25 @@ func (tx *Tx) RemoveIndex(collection, path string, kind IndexKind) error {
 }
 
 func (tx *Tx) RemoveIndexMode(collection, path string, mode IndexMode) error {
-	kind, _, err := indexModeParts(mode)
+	kind, unique, err := indexModeParts(mode)
 	if err != nil {
 		return err
 	}
-	return tx.RemoveIndex(collection, path, kind)
+	if !tx.write {
+		return ErrReadOnlyTx
+	}
+	col, ok := tx.state.Collections[collection]
+	if !ok {
+		return nil
+	}
+	k := indexKey(path, kind, unique)
+	if _, ok := col.Indexes[k]; !ok {
+		return ErrIndexNotFound
+	}
+	delete(col.Indexes, k)
+	delete(col.runtime, k)
+	tx.db.markFullDirty()
+	return nil
 }
 
 func (tx *Tx) Exec(q *Query, opts *ExecOptions) (int64, error) {
@@ -312,7 +329,7 @@ func (tx *Tx) ensureCollection(name string) *collectionState {
 		return col
 	}
 	tx.state.NextCollectionID++
-	col := &collectionState{Name: name, DBID: tx.state.NextCollectionID, NextID: 0, Docs: make(map[int64]json.RawMessage), Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
+	col := &collectionState{Name: name, DBID: tx.state.NextCollectionID, NextID: 0, Docs: make(map[int64]jsontext.Value), Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
 	tx.state.Collections[name] = col
 	return col
 }
