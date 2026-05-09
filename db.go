@@ -92,10 +92,7 @@ func (db *DB) load() error {
 		db.state = st
 	}
 	db.prepareState()
-	if err := db.loadDocs(); err != nil {
-		return err
-	}
-	return db.rebuildAllIndexes()
+	return nil
 }
 
 func (db *DB) prepareState() {
@@ -107,9 +104,6 @@ func (db *DB) prepareState() {
 	}
 	for name, c := range db.state.Collections {
 		c.Name = name
-		if c.Docs == nil {
-			c.Docs = make(map[int64]jsontext.Value)
-		}
 		if c.Indexes == nil {
 			c.Indexes = make(map[string]indexState)
 		}
@@ -118,25 +112,7 @@ func (db *DB) prepareState() {
 }
 
 func (db *DB) loadDocs() error {
-	return scanPrefix(db.engine, []byte{keyTagDoc}, func(key, value []byte) error {
-		collName, id, ok := decodeDocKey(key)
-		if !ok {
-			return withCode(CodeInvalidQuery, "invalid document key in storage")
-		}
-		raw, _, err := decodeStoredDocument(value)
-		if err != nil {
-			return err
-		}
-		col, ok := db.state.Collections[collName]
-		if !ok {
-			col = db.ensureCollectionOnStateLocked(db.state, collName)
-		}
-		col.Docs[id] = raw
-		if id > col.NextID {
-			col.NextID = id
-		}
-		return nil
-	})
+	return nil
 }
 
 func (db *DB) Close() error {
@@ -193,9 +169,12 @@ func (db *DB) RemoveCollection(name string) error {
 	if db.closed {
 		return ErrClosed
 	}
+	col, ok := db.state.Collections[name]
+	if !ok {
+		return nil
+	}
 	delete(db.state.Collections, name)
-	db.markFullDirty()
-	return db.commitLocked()
+	return db.dropCollectionDataAndCommitLocked(col)
 }
 
 func (db *DB) RenameCollection(oldName, newName string) error {
@@ -214,7 +193,7 @@ func (db *DB) RenameCollection(oldName, newName string) error {
 	delete(db.state.Collections, oldName)
 	col.Name = newName
 	db.state.Collections[newName] = col
-	db.markFullDirty()
+	db.markMetaDirty()
 	return db.commitLocked()
 }
 
@@ -263,11 +242,11 @@ func (db *DB) Get(collection string, id int64) (jsontext.Value, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return nil, ErrNotFound
+	raw, err := db.getDocRaw(db.engine, col, id)
+	if err != nil {
+		return nil, err
 	}
-	return append(jsontext.Value(nil), raw...), nil
+	return raw, nil
 }
 
 func (db *DB) Delete(collection string, id int64) error {
@@ -280,17 +259,19 @@ func (db *DB) Delete(collection string, id int64) error {
 	if !ok {
 		return ErrNotFound
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return ErrNotFound
+	raw, err := db.getDocRaw(db.engine, col, id)
+	if err != nil {
+		return err
 	}
 	var doc any
 	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
-	db.removeDocFromIndexes(col, id, doc)
-	delete(col.Docs, id)
 	db.recordDocDelete(col.Name, id, raw)
+	if col.RNum > 0 {
+		col.RNum--
+	}
+	db.adjustIndexRNums(col, doc, nil)
 	return db.commitLocked()
 }
 
@@ -304,9 +285,9 @@ func (db *DB) Patch(collection string, id int64, patch []byte) error {
 	if !ok {
 		return ErrNotFound
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return ErrNotFound
+	raw, err := db.getDocRaw(db.engine, col, id)
+	if err != nil {
+		return err
 	}
 	newRaw, err := applyJSONPatch(raw, patch)
 	if err != nil {
@@ -325,8 +306,8 @@ func (db *DB) MergeOrPut(collection string, id int64, patch []byte) error {
 		return ErrClosed
 	}
 	col := db.ensureCollectionLocked(collection)
-	raw, ok := col.Docs[id]
-	if !ok {
+	raw, err := db.getDocRaw(db.engine, col, id)
+	if errors.Is(err, ErrNotFound) {
 		if id > col.NextID {
 			col.NextID = id
 		}
@@ -334,6 +315,9 @@ func (db *DB) MergeOrPut(collection string, id int64, patch []byte) error {
 			return err
 		}
 		return db.commitLocked()
+	}
+	if err != nil {
+		return err
 	}
 	newRaw, err := applyMergePatch(raw, patch)
 	if err != nil {
@@ -377,7 +361,7 @@ func (db *DB) EnsureIndex(collection, path string, kind IndexKind, unique bool) 
 		return err
 	}
 	db.state.NextCollectionID = nextDBID
-	db.markFullDirty()
+	db.markMetaDirty()
 	return db.commitLocked()
 }
 
@@ -399,19 +383,18 @@ func (db *DB) RemoveIndex(collection, path string, kind IndexKind) error {
 	if !ok {
 		return ErrCollectionAbsent
 	}
-	removed := false
+	var removed []indexState
 	for k, idx := range col.Indexes {
 		if idx.Path == path && idx.Kind == kind {
+			removed = append(removed, idx)
 			delete(col.Indexes, k)
 			delete(col.runtime, k)
-			removed = true
 		}
 	}
-	if !removed {
+	if len(removed) == 0 {
 		return ErrIndexNotFound
 	}
-	db.markFullDirty()
-	return db.commitLocked()
+	return db.dropIndexesDataAndCommitLocked(removed)
 }
 
 func (db *DB) RemoveIndexMode(collection, path string, mode IndexMode) error {
@@ -429,13 +412,13 @@ func (db *DB) RemoveIndexMode(collection, path string, mode IndexMode) error {
 		return nil
 	}
 	k := indexKey(path, kind, unique)
-	if _, ok := col.Indexes[k]; !ok {
+	idx, ok := col.Indexes[k]
+	if !ok {
 		return ErrIndexNotFound
 	}
 	delete(col.Indexes, k)
 	delete(col.runtime, k)
-	db.markFullDirty()
-	return db.commitLocked()
+	return db.dropIndexesDataAndCommitLocked([]indexState{idx})
 }
 
 func validateIndexDefinition(path string, kind IndexKind) error {
@@ -665,12 +648,14 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 		snap = db.engine.NewSnapshot()
 		reader = snap
 		defer snap.Close()
+	} else {
+		reader = db.engine
 	}
 	var candidateIDs []int64
 	var candidate candidatePlan
 	usedIndex := false
 	usedOrderIndex := false
-	if !pq.noidx {
+	if !pq.noidx && useStorage && len(db.pending) == 0 {
 		if plan, ok := pq.filter.candidate(col, q); ok {
 			candidate = plan
 			usedIndex = true
@@ -709,16 +694,15 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 	if candidateIDs == nil {
 		var err error
 		if useStorage {
-			candidateIDs, err = db.scanDocumentIDs(reader, collection)
+			candidateIDs, err = db.scanDocumentIDs(reader, col)
 			if err != nil {
 				return nil, 0, false, err
 			}
 		} else {
-			candidateIDs = make([]int64, 0, len(col.Docs))
-			for id := range col.Docs {
-				candidateIDs = append(candidateIDs, id)
+			candidateIDs, err = db.scanDocumentIDs(db.engine, col)
+			if err != nil {
+				return nil, 0, false, err
 			}
-			sort.Slice(candidateIDs, func(i, j int) bool { return candidateIDs[i] < candidateIDs[j] })
 		}
 	}
 	if opts.Log != nil {
@@ -924,12 +908,25 @@ func (db *DB) runQueryLocked(state *dbState, q *Query, mode queryMode, opts *Exe
 }
 
 func (db *DB) canUseStorageQuery(state *dbState) bool {
-	return state == db.state && len(db.pending) == 0 && !db.dirtyFull
+	return len(db.pending) == 0 && !db.dirtyFull
 }
 
 func (db *DB) docForQuery(reader queryReader, col *collectionState, collection string, id int64, useStorage bool) (jsontext.Value, any, bool, error) {
-	if useStorage {
-		stored, err := reader.Get(keyDoc(collection, id))
+	if raw, ok, deleted, err := db.pendingDoc(collection, id); ok || deleted || err != nil {
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if deleted {
+			return nil, nil, false, nil
+		}
+		var node any
+		if err := decodeJSONDocument(raw, &node); err != nil {
+			return nil, nil, false, err
+		}
+		return raw, node, true, nil
+	}
+	if useStorage || reader != nil {
+		stored, err := reader.Get(keyDoc(col.DBID, id))
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return nil, nil, false, nil
@@ -942,29 +939,67 @@ func (db *DB) docForQuery(reader queryReader, col *collectionState, collection s
 		}
 		return raw, node, true, nil
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return nil, nil, false, nil
-	}
-	var node any
-	if err := decodeJSONDocument(raw, &node); err != nil {
-		return nil, nil, false, err
-	}
-	return append(jsontext.Value(nil), raw...), node, true, nil
+	return nil, nil, false, nil
 }
 
-func (db *DB) scanDocumentIDs(reader queryReader, collection string) ([]int64, error) {
-	prefix := keyDocPrefix(collection)
+func (db *DB) scanDocumentIDs(reader queryReader, col *collectionState) ([]int64, error) {
+	if col == nil {
+		return nil, nil
+	}
+	prefix := keyDocPrefix(col.DBID)
+	seen := make(map[int64]struct{})
+	deleted := make(map[int64]struct{})
 	ids := make([]int64, 0)
 	err := scanPrefix(reader, prefix, func(key, _ []byte) error {
 		_, id, ok := decodeDocKey(key)
 		if !ok {
 			return withCode(CodeInvalidQuery, "invalid document key in storage")
 		}
+		if _, ok := deleted[id]; ok {
+			return nil
+		}
+		seen[id] = struct{}{}
 		ids = append(ids, id)
 		return nil
 	})
+	for _, m := range db.pending {
+		if m.collection != col.Name {
+			continue
+		}
+		switch m.kind {
+		case mutationPut:
+			if _, ok := seen[m.id]; !ok {
+				ids = append(ids, m.id)
+				seen[m.id] = struct{}{}
+			}
+		case mutationDelete:
+			deleted[m.id] = struct{}{}
+		}
+	}
+	if len(deleted) > 0 {
+		out := ids[:0]
+		for _, id := range ids {
+			if _, ok := deleted[id]; !ok {
+				out = append(out, id)
+			}
+		}
+		ids = out
+	}
 	return ids, err
+}
+
+func (db *DB) pendingDoc(collection string, id int64) (jsontext.Value, bool, bool, error) {
+	for i := len(db.pending) - 1; i >= 0; i-- {
+		m := db.pending[i]
+		if m.collection != collection || m.id != id {
+			continue
+		}
+		if m.kind == mutationDelete {
+			return nil, false, true, nil
+		}
+		return append(jsontext.Value(nil), m.newRaw...), true, false, nil
+	}
+	return nil, false, false, nil
 }
 
 func chooseOrderByIndexPlan(col *collectionState, path string, desc bool) (candidatePlan, bool) {
@@ -1029,9 +1064,9 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 	}
 	scanNonUniqueValue := func(value string) error {
 		entries := make([]indexEntry, 0)
-		if err := scanPrefix(reader, keyIndexValuePrefix(collection, idx, value), func(key, _ []byte) error {
-			_, kind, path, _, id, ok := decodeIndexKey(key)
-			if !ok || kind != idx.Kind || path != idx.Path {
+		if err := scanPrefix(reader, keyIndexValuePrefix(idx, value), func(key, _ []byte) error {
+			dbid, _, id, ok := decodeIndexKey(key)
+			if !ok || dbid != idx.DBID {
 				return withCode(CodeInvalidQuery, "invalid index key in storage")
 			}
 			entries = append(entries, indexEntry{value: value, id: id})
@@ -1046,7 +1081,7 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 		return nil
 	}
 	addUniqueValue := func(value string) error {
-		raw, err := reader.Get(keyUniqueIndex(collection, idx, value))
+		raw, err := reader.Get(keyUniqueIndex(idx, value))
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return nil
@@ -1063,9 +1098,9 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 	scanPath := func(match func(value string) bool, valueDesc bool) error {
 		entries := make([]indexEntry, 0)
 		if idx.Unique {
-			if err := scanPrefix(reader, keyUniqueIndexPathPrefix(collection, idx), func(key, value []byte) error {
-				_, kind, path, indexedValue, ok := decodeUniqueIndexKey(key)
-				if !ok || kind != idx.Kind || path != idx.Path {
+			if err := scanPrefix(reader, keyUniqueIndexPathPrefix(idx), func(key, value []byte) error {
+				dbid, indexedValue, ok := decodeUniqueIndexKey(key)
+				if !ok || dbid != idx.DBID {
 					return withCode(CodeInvalidQuery, "invalid unique index key in storage")
 				}
 				if !match(indexedValue) {
@@ -1086,9 +1121,9 @@ func (db *DB) scanIndexCandidateIDs(reader queryReader, collection string, plan 
 			}
 			return nil
 		}
-		if err := scanPrefix(reader, keyIndexPathPrefix(collection, idx), func(key, _ []byte) error {
-			_, kind, path, indexedValue, id, ok := decodeIndexKey(key)
-			if !ok || kind != idx.Kind || path != idx.Path {
+		if err := scanPrefix(reader, keyIndexPathPrefix(idx), func(key, _ []byte) error {
+			dbid, indexedValue, id, ok := decodeIndexKey(key)
+			if !ok || dbid != idx.DBID {
 				return withCode(CodeInvalidQuery, "invalid index key in storage")
 			}
 			if match(indexedValue) {
@@ -1506,9 +1541,11 @@ func (db *DB) applyActionLocked(state *dbState, col *collectionState, q *Query, 
 		return 0, nil
 	case actionDelete:
 		for _, m := range window {
-			db.removeDocFromIndexes(col, m.id, m.node)
-			delete(col.Docs, m.id)
 			db.recordDocDelete(col.Name, m.id, m.raw)
+			if col.RNum > 0 {
+				col.RNum--
+			}
+			db.adjustIndexRNums(col, m.node, nil)
 		}
 		return int64(len(window)), nil
 	case actionApply:
@@ -1629,12 +1666,11 @@ func (db *DB) joinValueLocked(state *dbState, coll string, v any) (any, error) {
 		return nil, nil
 	}
 	joinOne := func(id int64) (any, error) {
-		raw, ok := c.Docs[id]
-		if !ok {
+		_, out, err := db.getDocNode(db.engine, c, id)
+		if errors.Is(err, ErrNotFound) {
 			return nil, nil
 		}
-		var out any
-		if err := decodeJSONDocument(raw, &out); err != nil {
+		if err != nil {
 			return nil, err
 		}
 		return out, nil
@@ -1698,7 +1734,7 @@ func (db *DB) ensureCollectionOnStateLocked(state *dbState, name string) *collec
 		return col
 	}
 	state.NextCollectionID++
-	col := &collectionState{Name: name, DBID: state.NextCollectionID, NextID: 0, Docs: make(map[int64]jsontext.Value), Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
+	col := &collectionState{Name: name, DBID: state.NextCollectionID, NextID: 0, Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
 	state.Collections[name] = col
 	return col
 }
@@ -1709,26 +1745,152 @@ func (db *DB) putLocked(col *collectionState, id int64, raw []byte) error {
 		return err
 	}
 	var oldRaw jsontext.Value
-	if old, ok := col.Docs[id]; ok {
+	var oldDoc any
+	var old jsontext.Value
+	exists := false
+	if raw, ok, deleted, perr := db.pendingDoc(col.Name, id); ok || deleted || perr != nil {
+		if perr != nil {
+			return perr
+		}
+		if ok {
+			old = raw
+			exists = true
+		}
+	} else {
+		var getErr error
+		old, getErr = db.getDocRaw(db.engine, col, id)
+		exists = getErr == nil
+		if getErr != nil && !errors.Is(getErr, ErrNotFound) {
+			return getErr
+		}
+	}
+	if exists {
 		oldRaw = append(jsontext.Value(nil), old...)
-		var oldDoc any
 		if err := decodeJSONDocument(old, &oldDoc); err != nil {
 			return err
 		}
-		db.removeDocFromIndexes(col, id, oldDoc)
 	}
-	if err := db.addDocToIndexes(col, id, doc); err != nil {
-		if old, ok := col.Docs[id]; ok {
-			var oldDoc any
-			if err := decodeJSONDocument(old, &oldDoc); err == nil {
-				_ = db.addDocToIndexes(col, id, oldDoc)
-			}
-		}
+	if err := db.checkUniqueConstraints(col, id, doc); err != nil {
 		return err
 	}
-	col.Docs[id] = canon
+	if !exists {
+		col.RNum++
+	}
+	db.adjustIndexRNums(col, oldDoc, doc)
 	db.recordDocPut(col.Name, id, oldRaw, canon)
 	return nil
+}
+
+func (db *DB) getDocRaw(reader queryReader, col *collectionState, id int64) (jsontext.Value, error) {
+	if col == nil {
+		return nil, ErrNotFound
+	}
+	stored, err := reader.Get(keyDoc(col.DBID, id))
+	if err != nil {
+		return nil, err
+	}
+	raw, _, err := decodeStoredDocument(stored)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func (db *DB) getDocNode(reader queryReader, col *collectionState, id int64) (jsontext.Value, any, error) {
+	if col == nil {
+		return nil, nil, ErrNotFound
+	}
+	stored, err := reader.Get(keyDoc(col.DBID, id))
+	if err != nil {
+		return nil, nil, err
+	}
+	return decodeStoredDocument(stored)
+}
+
+func (db *DB) checkUniqueConstraints(col *collectionState, id int64, doc any) error {
+	for _, idx := range col.Indexes {
+		if !idx.Unique {
+			continue
+		}
+		newVals := valuesForIndex(doc, idx.Path, idx.Kind)
+		for _, value := range newVals {
+			raw, err := db.engine.Get(keyUniqueIndex(idx, value))
+			if err != nil {
+				if errors.Is(err, ErrNotFound) {
+					continue
+				}
+				return err
+			}
+			cur, err := parseU64(raw)
+			if err != nil {
+				return err
+			}
+			if int64(cur) != id && !db.pendingDeletes(col.Name, int64(cur)) {
+				return ErrUniqueConstraint
+			}
+		}
+		if len(db.pending) == 0 || len(newVals) == 0 {
+			continue
+		}
+		want := make(map[string]struct{}, len(newVals))
+		for _, v := range newVals {
+			want[v] = struct{}{}
+		}
+		pending := make(map[int64]jsontext.Value)
+		deleted := make(map[int64]struct{})
+		for _, m := range db.pending {
+			if m.collection != col.Name || m.id == id {
+				continue
+			}
+			switch m.kind {
+			case mutationPut:
+				pending[m.id] = m.newRaw
+				delete(deleted, m.id)
+			case mutationDelete:
+				delete(pending, m.id)
+				deleted[m.id] = struct{}{}
+			}
+		}
+		_ = deleted
+		for otherID, raw := range pending {
+			var other any
+			if err := decodeJSONDocument(raw, &other); err != nil {
+				return err
+			}
+			for _, v := range valuesForIndex(other, idx.Path, idx.Kind) {
+				if _, ok := want[v]; ok && otherID != id {
+					return ErrUniqueConstraint
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (db *DB) pendingDeletes(collection string, id int64) bool {
+	for i := len(db.pending) - 1; i >= 0; i-- {
+		m := db.pending[i]
+		if m.collection != collection || m.id != id {
+			continue
+		}
+		return m.kind == mutationDelete
+	}
+	return false
+}
+
+func (db *DB) adjustIndexRNums(col *collectionState, oldDoc, newDoc any) {
+	for k, idx := range col.Indexes {
+		oldVals := valuesForIndex(oldDoc, idx.Path, idx.Kind)
+		newVals := valuesForIndex(newDoc, idx.Path, idx.Kind)
+		idx.RNum += len(newVals) - len(oldVals)
+		if idx.RNum < 0 {
+			idx.RNum = 0
+		}
+		col.Indexes[k] = idx
+		if rt := col.runtime[k]; rt != nil {
+			rt.def = idx
+		}
+	}
 }
 
 func normalizeRawJSON(raw []byte) (jsontext.Value, any, error) {
@@ -1761,47 +1923,72 @@ func decodeJSONDocument(raw []byte, out *any) error {
 }
 
 func (db *DB) rebuildAllIndexes() error {
-	for _, col := range db.state.Collections {
-		col.initRuntime()
-		for k := range col.Indexes {
-			if err := db.rebuildIndex(col, k); err != nil {
-				return err
-			}
-		}
-	}
 	return nil
 }
 
 func (db *DB) rebuildIndex(col *collectionState, key string) error {
-	idx, ok := col.runtime[key]
+	idx, ok := col.Indexes[key]
 	if !ok {
 		return nil
 	}
-	idx.unique = make(map[string]int64)
-	idx.multi = make(map[string]map[int64]struct{})
-	for id, raw := range col.Docs {
-		var doc any
-		if err := decodeJSONDocument(raw, &doc); err != nil {
-			return err
-		}
-		vals := valuesForIndex(doc, idx.def.Path, idx.def.Kind)
+	b := db.engine.NewBatch()
+	defer b.Close()
+	if err := b.DeleteRange(keyIndexPathPrefix(idx), prefixEnd(keyIndexPathPrefix(idx))); err != nil {
+		return err
+	}
+	if err := b.DeleteRange(keyUniqueIndexPathPrefix(idx), prefixEnd(keyUniqueIndexPathPrefix(idx))); err != nil {
+		return err
+	}
+	seen := make(map[string]int64)
+	rnum := 0
+	err := db.scanDocsForCollection(db.engine, col, func(id int64, raw jsontext.Value, doc any) error {
+		vals := valuesForIndex(doc, idx.Path, idx.Kind)
 		for _, v := range vals {
-			if idx.def.Unique {
-				if cur, ok := idx.unique[v]; ok && cur != id {
+			if idx.Unique {
+				if cur, ok := seen[v]; ok && cur != id {
 					return ErrUniqueConstraint
 				}
-				idx.unique[v] = id
-			} else {
-				set := idx.multi[v]
-				if set == nil {
-					set = make(map[int64]struct{})
-					idx.multi[v] = set
+				seen[v] = id
+				if err := b.Set(keyUniqueIndex(idx, v), putU64(nil, uint64(id))); err != nil {
+					return err
 				}
-				set[id] = struct{}{}
+			} else if err := b.Set(keyIndex(idx, v, id), []byte{1}); err != nil {
+				return err
 			}
+			rnum++
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	return nil
+	idx.RNum = rnum
+	col.Indexes[key] = idx
+	if rt := col.runtime[key]; rt != nil {
+		rt.def = idx
+	}
+	meta, err := encodeCatalog(db.state)
+	if err != nil {
+		return err
+	}
+	if err := b.Set(keyMetaState, meta); err != nil {
+		return err
+	}
+	return b.Commit()
+}
+
+func (db *DB) scanDocsForCollection(reader queryReader, col *collectionState, fn func(id int64, raw jsontext.Value, doc any) error) error {
+	return scanPrefix(reader, keyDocPrefix(col.DBID), func(key, value []byte) error {
+		_, id, ok := decodeDocKey(key)
+		if !ok {
+			return withCode(CodeInvalidQuery, "invalid document key in storage")
+		}
+		raw, doc, err := decodeStoredDocument(value)
+		if err != nil {
+			return err
+		}
+		return fn(id, raw, doc)
+	})
 }
 
 func (db *DB) addDocToIndexes(col *collectionState, id int64, doc any) error {
@@ -1862,8 +2049,13 @@ func valuesForIndex(doc any, path string, kind IndexKind) []string {
 		return nil
 	}
 	out := make([]string, 0, 1)
+	seen := make(map[string]struct{})
 	appendOne := func(x any) {
 		if s, ok := normalizeIndexValue(x, kind); ok {
+			if _, ok := seen[s]; ok {
+				return
+			}
+			seen[s] = struct{}{}
 			out = append(out, s)
 		}
 	}
@@ -2044,7 +2236,7 @@ func (db *DB) persistPendingLocked() error {
 	for _, m := range db.pending {
 		col := db.state.Collections[m.collection]
 		if col != nil {
-			if err := b.Set(keySeq(m.collection), putU64(nil, uint64(col.NextID))); err != nil {
+			if err := b.Set(keySeq(col.DBID), putU64(nil, uint64(col.NextID))); err != nil {
 				return err
 			}
 		}
@@ -2059,7 +2251,7 @@ func (db *DB) persistPendingLocked() error {
 			if err != nil {
 				return err
 			}
-			if err := b.Set(keyDoc(m.collection, m.id), stored); err != nil {
+			if err := b.Set(keyDoc(col.DBID, m.id), stored); err != nil {
 				return err
 			}
 			if err := db.setIndexKeys(b, m.collection, m.id, m.newRaw); err != nil {
@@ -2069,8 +2261,10 @@ func (db *DB) persistPendingLocked() error {
 			if err := db.deleteIndexKeys(b, m.collection, m.id, m.oldRaw); err != nil {
 				return err
 			}
-			if err := b.Delete(keyDoc(m.collection, m.id)); err != nil {
-				return err
+			if col != nil {
+				if err := b.Delete(keyDoc(col.DBID, m.id)); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -2079,6 +2273,54 @@ func (db *DB) persistPendingLocked() error {
 	}
 	db.clearPending()
 	return nil
+}
+
+func (db *DB) dropCollectionDataAndCommitLocked(col *collectionState) error {
+	meta, err := encodeCatalog(db.state)
+	if err != nil {
+		return err
+	}
+	b := db.engine.NewBatch()
+	defer b.Close()
+	if err := b.DeleteRange(keyDocPrefix(col.DBID), prefixEnd(keyDocPrefix(col.DBID))); err != nil {
+		return err
+	}
+	if err := b.Delete(keySeq(col.DBID)); err != nil {
+		return err
+	}
+	for _, idx := range col.Indexes {
+		if err := b.DeleteRange(keyIndexPathPrefix(idx), prefixEnd(keyIndexPathPrefix(idx))); err != nil {
+			return err
+		}
+		if err := b.DeleteRange(keyUniqueIndexPathPrefix(idx), prefixEnd(keyUniqueIndexPathPrefix(idx))); err != nil {
+			return err
+		}
+	}
+	if err := b.Set(keyMetaState, meta); err != nil {
+		return err
+	}
+	return b.Commit()
+}
+
+func (db *DB) dropIndexesDataAndCommitLocked(indexes []indexState) error {
+	meta, err := encodeCatalog(db.state)
+	if err != nil {
+		return err
+	}
+	b := db.engine.NewBatch()
+	defer b.Close()
+	for _, idx := range indexes {
+		if err := b.DeleteRange(keyIndexPathPrefix(idx), prefixEnd(keyIndexPathPrefix(idx))); err != nil {
+			return err
+		}
+		if err := b.DeleteRange(keyUniqueIndexPathPrefix(idx), prefixEnd(keyUniqueIndexPathPrefix(idx))); err != nil {
+			return err
+		}
+	}
+	if err := b.Set(keyMetaState, meta); err != nil {
+		return err
+	}
+	return b.Commit()
 }
 
 func (db *DB) deleteIndexKeys(b StorageBatch, collection string, id int64, raw []byte) error {
@@ -2093,10 +2335,10 @@ func (db *DB) deleteIndexKeys(b StorageBatch, collection string, id int64, raw [
 	for _, idx := range col.Indexes {
 		for _, value := range valuesForIndex(doc, idx.Path, idx.Kind) {
 			if idx.Unique {
-				if err := b.Delete(keyUniqueIndex(collection, idx, value)); err != nil {
+				if err := b.Delete(keyUniqueIndex(idx, value)); err != nil {
 					return err
 				}
-			} else if err := b.Delete(keyIndex(collection, idx, value, id)); err != nil {
+			} else if err := b.Delete(keyIndex(idx, value, id)); err != nil {
 				return err
 			}
 		}
@@ -2116,10 +2358,10 @@ func (db *DB) setIndexKeys(b StorageBatch, collection string, id int64, raw []by
 	for _, idx := range col.Indexes {
 		for _, value := range valuesForIndex(doc, idx.Path, idx.Kind) {
 			if idx.Unique {
-				if err := b.Set(keyUniqueIndex(collection, idx, value), putU64(nil, uint64(id))); err != nil {
+				if err := b.Set(keyUniqueIndex(idx, value), putU64(nil, uint64(id))); err != nil {
 					return err
 				}
-			} else if err := b.Set(keyIndex(collection, idx, value, id), []byte{1}); err != nil {
+			} else if err := b.Set(keyIndex(idx, value, id), []byte{1}); err != nil {
 				return err
 			}
 		}
@@ -2134,41 +2376,12 @@ func (db *DB) persistFullLocked() error {
 	}
 	b := db.engine.NewBatch()
 	defer b.Close()
-	for _, prefix := range [][]byte{{keyTagDoc}, {keyTagSeq}, {keyTagIdx}, {keyTagUIdx}} {
-		if err := b.DeleteRange(prefix, prefixEnd(prefix)); err != nil {
-			return err
-		}
-	}
 	if err := b.Set(keyMetaState, meta); err != nil {
 		return err
 	}
-	for name, col := range db.state.Collections {
-		if err := b.Set(keySeq(name), putU64(nil, uint64(col.NextID))); err != nil {
+	for _, col := range db.state.Collections {
+		if err := b.Set(keySeq(col.DBID), putU64(nil, uint64(col.NextID))); err != nil {
 			return err
-		}
-		for id, raw := range col.Docs {
-			stored, err := db.encodeStoredRaw(raw)
-			if err != nil {
-				return err
-			}
-			if err := b.Set(keyDoc(name, id), stored); err != nil {
-				return err
-			}
-			var doc any
-			if err := decodeJSONDocument(raw, &doc); err != nil {
-				return err
-			}
-			for _, idx := range col.Indexes {
-				for _, value := range valuesForIndex(doc, idx.Path, idx.Kind) {
-					if idx.Unique {
-						if err := b.Set(keyUniqueIndex(name, idx, value), putU64(nil, uint64(id))); err != nil {
-							return err
-						}
-					} else if err := b.Set(keyIndex(name, idx, value, id), []byte{1}); err != nil {
-						return err
-					}
-				}
-			}
 		}
 	}
 	if err := b.Commit(); err != nil {

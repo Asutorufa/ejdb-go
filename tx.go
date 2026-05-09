@@ -1,13 +1,17 @@
 package ejdb
 
 import (
+	"errors"
+
 	"github.com/go-json-experiment/json/jsontext"
 )
 
 type Tx struct {
-	db    *DB
-	state *dbState
-	write bool
+	db     *DB
+	state  *dbState
+	reader queryReader
+	closer interface{ Close() error }
+	write  bool
 }
 
 func (db *DB) ReadTx(fn func(*Tx) error) error {
@@ -21,7 +25,9 @@ func (db *DB) ReadTx(fn func(*Tx) error) error {
 	if err != nil {
 		return err
 	}
-	return fn(&Tx{db: db, state: snapshot, write: false})
+	snap := db.engine.NewSnapshot()
+	defer snap.Close()
+	return fn(&Tx{db: db, state: snapshot, reader: snap, closer: snap, write: false})
 }
 
 func (db *DB) WriteTx(fn func(*Tx) error) error {
@@ -35,7 +41,7 @@ func (db *DB) WriteTx(fn func(*Tx) error) error {
 		return err
 	}
 	pendingLen, dirtyMeta, dirtyFull := len(db.pending), db.dirtyMeta, db.dirtyFull
-	tx := &Tx{db: db, state: db.state, write: true}
+	tx := &Tx{db: db, state: db.state, reader: db.engine, write: true}
 	if err := fn(tx); err != nil {
 		db.state = snapshot
 		db.truncatePending(pendingLen, dirtyMeta, dirtyFull)
@@ -122,11 +128,22 @@ func (tx *Tx) Get(collection string, id int64) (jsontext.Value, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return nil, ErrNotFound
+	if tx.write {
+		if raw, ok, deleted, err := tx.db.pendingDoc(collection, id); ok || deleted || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			if deleted {
+				return nil, ErrNotFound
+			}
+			return raw, nil
+		}
 	}
-	return append(jsontext.Value(nil), raw...), nil
+	reader := tx.reader
+	if reader == nil {
+		reader = tx.db.engine
+	}
+	return tx.db.getDocRaw(reader, col, id)
 }
 
 func (tx *Tx) Delete(collection string, id int64) error {
@@ -137,17 +154,19 @@ func (tx *Tx) Delete(collection string, id int64) error {
 	if !ok {
 		return ErrNotFound
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return ErrNotFound
+	raw, err := tx.Get(collection, id)
+	if err != nil {
+		return err
 	}
 	var doc any
 	if err := decodeJSONDocument(raw, &doc); err != nil {
 		return err
 	}
-	tx.db.removeDocFromIndexes(col, id, doc)
-	delete(col.Docs, id)
 	tx.db.recordDocDelete(col.Name, id, raw)
+	if col.RNum > 0 {
+		col.RNum--
+	}
+	tx.db.adjustIndexRNums(col, doc, nil)
 	return nil
 }
 
@@ -159,9 +178,9 @@ func (tx *Tx) Patch(collection string, id int64, patch []byte) error {
 	if !ok {
 		return ErrNotFound
 	}
-	raw, ok := col.Docs[id]
-	if !ok {
-		return ErrNotFound
+	raw, err := tx.Get(collection, id)
+	if err != nil {
+		return err
 	}
 	newRaw, err := applyJSONPatch(raw, patch)
 	if err != nil {
@@ -175,12 +194,15 @@ func (tx *Tx) MergeOrPut(collection string, id int64, patch []byte) error {
 		return ErrReadOnlyTx
 	}
 	col := tx.ensureCollection(collection)
-	raw, ok := col.Docs[id]
-	if !ok {
+	raw, err := tx.Get(collection, id)
+	if errors.Is(err, ErrNotFound) {
 		if id > col.NextID {
 			col.NextID = id
 		}
 		return tx.db.putLocked(col, id, patch)
+	}
+	if err != nil {
+		return err
 	}
 	newRaw, err := applyMergePatch(raw, patch)
 	if err != nil {
@@ -329,7 +351,7 @@ func (tx *Tx) ensureCollection(name string) *collectionState {
 		return col
 	}
 	tx.state.NextCollectionID++
-	col := &collectionState{Name: name, DBID: tx.state.NextCollectionID, NextID: 0, Docs: make(map[int64]jsontext.Value), Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
+	col := &collectionState{Name: name, DBID: tx.state.NextCollectionID, NextID: 0, Indexes: make(map[string]indexState), runtime: make(map[string]*indexRuntime)}
 	tx.state.Collections[name] = col
 	return col
 }

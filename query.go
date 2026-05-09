@@ -458,7 +458,7 @@ func candidateFromComparison(col *collectionState, q *Query, pathPattern string,
 		if rt.def.Path != path {
 			continue
 		}
-		weight, cursorInit, cursorStep, ok := indexOpPlan(rt.def, cmp.op, val, len(col.Docs))
+		weight, cursorInit, cursorStep, ok := indexOpPlan(rt.def, cmp.op, val, col.RNum)
 		if !ok {
 			continue
 		}
@@ -470,7 +470,7 @@ func candidateFromComparison(col *collectionState, q *Query, pathPattern string,
 			weight:     weight,
 			cursorInit: cursorInit,
 			cursorStep: cursorStep,
-			rnum:       len(col.Docs),
+			rnum:       col.RNum,
 			pathCnt:    indexPathTokenCount(rt.def.Path),
 		}
 		plan.explain = fmt.Sprintf("%s %s %v", path, cmp.op, val)

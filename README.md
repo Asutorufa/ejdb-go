@@ -9,14 +9,28 @@ This project keeps the embedded EJDB2-style API, JQL-like queries, indexes, patc
 The on-disk format is this project's own Pebble key/value layout:
 
 - `meta/state`: catalog, collection, and index metadata
-- `seq/<collection>`: collection auto-increment sequence
-- `doc/<collection>/<id>`: JBL/Binn-style binary JSON document
-- `idx/<collection>/<mode>/<path>/<value>/<id>`: non-unique index entry
-- `uidx/<collection>/<mode>/<path>/<value>`: unique index entry
+- `seq/<collection-dbid>`: collection auto-increment sequence
+- `doc/<collection-dbid>/<id>`: JBL/Binn-style binary JSON document
+- `idx/<index-dbid>/<sortable-value>/<id>`: non-unique index entry
+- `uidx/<index-dbid>/<sortable-value>`: unique index entry
 
 The metadata contains a `format_version`. This implementation does not perform online migrations yet: opening an older or unknown format returns `EJDB_INCOMPATIBLE_FORMAT` and does not delete or rewrite the database directory.
 
 Documents are accepted and returned as JSON, but persisted as a JBL/Binn-style binary encoding with typed null, bool, integer, float32, float64, string-family, blob-family, array, map, and object values. Object keys follow the official Binn 255-byte limit. The Pebble file layout is still project-specific and is not binary-compatible with official EJDB2/IWKV database files.
+
+## Implementation Model
+
+The public API boundary is JSON, while the durable document value is JBL/Binn binary. Pebble is the source of truth for document bodies and index entries; the in-memory database state keeps only lightweight catalog data such as collection names, DBIDs, next document IDs, record counts, index definitions, and index entry counts.
+
+Opening a database no longer decodes every stored document into Go heap memory. Reads use Pebble `Get`, queries use Pebble snapshot iterators over document or index key ranges, and writes update document keys, index keys, and catalog metadata through Pebble batches. `ReadTx` uses a Pebble snapshot for stable reads, while `WriteTx` buffers uncommitted mutations in memory until commit.
+
+Memory use is therefore driven mainly by catalog size, Pebble's own cache/page working set, active query result windows, sorter spill buffers, and active write-transaction overlays. Large unindexed scans still read and decode each visited document, and large unordered sorts still need temporary result metadata, but documents are not kept as a permanent process-wide cache.
+
+## Compared With Softmotions/EJDB2
+
+Softmotions EJDB2 is powered by IOWOW: a C storage engine based on mmap-backed persistent skiplist databases, WAL, and a single-file layout. This project uses Pebble's LSM-tree storage instead, so it does not reproduce EJDB2's mmap layout, IWKV/IOWOW file format, or WAL/checkpoint internals.
+
+The intended compatibility is at the embedded JSON database layer: EJDB-style collections, document IDs, JQL-like query behavior, JSON patching, projections, joins, and typed indexes. The current implementation follows the same broad disk-oriented idea as EJDB2 by keeping documents and indexes in persistent storage rather than caching all JSON documents in memory.
 
 ## Features
 
@@ -30,7 +44,7 @@ Documents are accepted and returned as JSON, but persisted as a JBL/Binn-style b
 - JBL/Binn-style binary document persistence with JSON input/output at the public API boundary, including official Binn numeric, string-family, blob-family, list, map, and object type coverage
 - JSON encoding/decoding through `github.com/go-json-experiment/json` and `jsontext.Value` raw values
 - Indexed equality, `in`, range, and string prefix planning
-- Query candidate and order-by index scans read from Pebble snapshot iterators; in-memory index maps are only planner/constraint caches
+- Query candidate and order-by index scans read from Pebble snapshot iterators; documents and index entries are not loaded into permanent in-memory maps
 - Official-style JQL canonical printer with `Query.Canonical()`
 - Collection management: create, remove, rename
 - Document CRUD: `PutNew`, `Put`, `Get`, `Delete`, `Patch`, `MergeOrPut`
@@ -116,24 +130,46 @@ For a quick local trend check:
 go test -bench . -benchmem -benchtime=200ms ./...
 ```
 
-### Benchmark Results
+### Sample Pebble Config Comparison
 
 Sample environment:
 
 - `goos: linux`
 - `goarch: amd64`
 - `cpu: AMD Ryzen 5 5600G with Radeon Graphics`
-- Command: `go test -bench . -benchmem -benchtime=200ms ./...`
+- Command: `go test -run '^$' -bench '^BenchmarkPebbleConfigs$' -benchmem -benchtime=200ms ./...`
 
-Latest sample:
+Configurations:
 
-- `BenchmarkPutNew-12`: `7928 ns/op`, `126291 docs/s`, `126291 ops/s`, `4034 B/op`, `72 allocs/op`
-- `BenchmarkPutNewWriteTx-12`: `4850 ns/op`, `216613 docs/s`, `216613 ops/s`, `3777 B/op`, `62 allocs/op`
-- `BenchmarkGetByID-12`: `58.59 ns/op`, `17075168 docs/s`, `17075168 ops/s`, `31 B/op`, `1 allocs/op`
-- `BenchmarkQueryScanVsIndex/scan-12`: `37160504 ns/op`, `26.91 docs/s`, `26.91 ops/s`, `9541929 B/op`, `319709 allocs/op`
-- `BenchmarkQueryScanVsIndex/indexed-12`: `8262 ns/op`, `121035 docs/s`, `121035 ops/s`, `1486 B/op`, `58 allocs/op`
-- `BenchmarkRangeQuery-12`: `4085015 ns/op`, `24489 docs/s`, `244.9 ops/s`, `1797940 B/op`, `72883 allocs/op`
-- `BenchmarkSortPagination-12`: `38457820 ns/op`, `1301 docs/s`, `26.02 ops/s`, `12220489 B/op`, `321313 allocs/op`
-- `BenchmarkUpdateDelete-12`: `67400 ns/op`, `29680 docs/s`, `14840 ops/s`, `18027 B/op`, `352 allocs/op`
+- `default`: Pebble defaults, unsynced writes.
+- `small_cache_1m`: 1 MiB block cache, 1 MiB memtable, unsynced writes.
+- `large_cache_64m`: 64 MiB block cache, 16 MiB memtable, unsynced writes.
+- `sync_writes`: 8 MiB block cache, 4 MiB memtable, synced writes.
+- `disable_wal`: 8 MiB block cache, 4 MiB memtable, Pebble WAL disabled; faster but not crash-safe.
 
-Regular document writes, updates, and deletes use incremental Pebble batches. Structural operations such as collection rename, collection removal, and index rebuild still use a full refresh to keep the implementation simple and reliable.
+| Config | Workload | ns/op | docs/s | ops/s |
+| --- | --- | ---: | ---: | ---: |
+| `default` | PutNew | 10225 | 99769 | 99769 |
+| `default` | GetByID | 3809 | 262641 | 262641 |
+| `default` | Indexed query | 9012 | 110994 | 110994 |
+| `default` | Range query | 3738430 | 26757 | 267.6 |
+| `small_cache_1m` | PutNew | 16453 | 60790 | 60790 |
+| `small_cache_1m` | GetByID | 10764 | 92924 | 92924 |
+| `small_cache_1m` | Indexed query | 23419 | 42712 | 42712 |
+| `small_cache_1m` | Range query | 4635217 | 21582 | 215.8 |
+| `large_cache_64m` | PutNew | 9443 | 105929 | 105929 |
+| `large_cache_64m` | GetByID | 2561 | 390633 | 390633 |
+| `large_cache_64m` | Indexed query | 6662 | 150146 | 150146 |
+| `large_cache_64m` | Range query | 3612264 | 27693 | 276.9 |
+| `sync_writes` | PutNew | 17047 | 58675 | 58675 |
+| `sync_writes` | GetByID | 3729 | 268436 | 268436 |
+| `sync_writes` | Indexed query | 9124 | 109713 | 109713 |
+| `sync_writes` | Range query | 3761250 | 26611 | 266.1 |
+| `disable_wal` | PutNew | 11292 | 88577 | 88577 |
+| `disable_wal` | GetByID | 3773 | 265175 | 265175 |
+| `disable_wal` | Indexed query | 8859 | 112912 | 112912 |
+| `disable_wal` | Range query | 3718093 | 26905 | 269.0 |
+
+The storage model is disk-backed and benchmark results are sensitive to Pebble options, filesystem cache state, and benchmark duration. Re-run the benchmark on the target machine before using these numbers for capacity planning.
+
+Regular document writes, updates, and deletes use incremental Pebble batches. Collection removal and index removal delete the affected DBID key ranges; index creation scans existing documents and builds the new persistent index.

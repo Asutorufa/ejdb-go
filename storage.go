@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/go-json-experiment/json/jsontext"
 )
 
 var keyMetaState = []byte("meta/state")
 
-const currentFormatVersion = 5
+const currentFormatVersion = 6
 
 const (
 	keyTagDoc  byte = 0x10
@@ -257,6 +256,7 @@ type catalogState struct {
 type catalogCollection struct {
 	DBID    int64                 `json:"dbid"`
 	NextID  int64                 `json:"next_id"`
+	RNum    int                   `json:"rnum"`
 	Indexes map[string]indexState `json:"indexes"`
 }
 
@@ -273,7 +273,7 @@ func catalogFromState(s *dbState) catalogState {
 		for k, v := range col.Indexes {
 			idx[k] = v
 		}
-		cat.Collections[name] = catalogCollection{DBID: col.DBID, NextID: col.NextID, Indexes: idx}
+		cat.Collections[name] = catalogCollection{DBID: col.DBID, NextID: col.NextID, RNum: col.RNum, Indexes: idx}
 	}
 	return cat
 }
@@ -299,7 +299,7 @@ func stateFromCatalog(cat catalogState) *dbState {
 			Name:    name,
 			DBID:    c.DBID,
 			NextID:  c.NextID,
-			Docs:    make(map[int64]jsontext.Value),
+			RNum:    c.RNum,
 			Indexes: idx,
 			runtime: make(map[string]*indexRuntime),
 		}
@@ -326,54 +326,50 @@ func decodeCatalog(raw []byte) (*dbState, error) {
 	return stateFromCatalog(cat), nil
 }
 
-func keySeq(collection string) []byte {
-	return appendSegment([]byte{keyTagSeq}, collection)
+func keySeq(dbid int64) []byte {
+	return appendI64([]byte{keyTagSeq}, dbid)
 }
 
-func keyDocPrefix(collection string) []byte {
-	return appendSegment([]byte{keyTagDoc}, collection)
+func keyDocPrefix(dbid int64) []byte {
+	return appendI64([]byte{keyTagDoc}, dbid)
 }
 
-func keyDoc(collection string, id int64) []byte {
-	k := keyDocPrefix(collection)
+func keyDoc(dbid int64, id int64) []byte {
+	k := keyDocPrefix(dbid)
 	return appendI64(k, id)
 }
 
-func keyIndexPrefix(collection string) []byte {
-	return appendSegment([]byte{keyTagIdx}, collection)
+func keyIndexPrefix(idx indexState) []byte {
+	return appendI64([]byte{keyTagIdx}, idx.DBID)
 }
 
-func keyUniqueIndexPrefix(collection string) []byte {
-	return appendSegment([]byte{keyTagUIdx}, collection)
+func keyUniqueIndexPrefix(idx indexState) []byte {
+	return appendI64([]byte{keyTagUIdx}, idx.DBID)
 }
 
-func keyIndexPathPrefix(collection string, idx indexState) []byte {
-	k := keyIndexPrefix(collection)
-	k = appendSegment(k, string(idx.Kind))
-	return appendSegment(k, idx.Path)
+func keyIndexPathPrefix(idx indexState) []byte {
+	return keyIndexPrefix(idx)
 }
 
-func keyUniqueIndexPathPrefix(collection string, idx indexState) []byte {
-	k := keyUniqueIndexPrefix(collection)
-	k = appendSegment(k, string(idx.Kind))
-	return appendSegment(k, idx.Path)
+func keyUniqueIndexPathPrefix(idx indexState) []byte {
+	return keyUniqueIndexPrefix(idx)
 }
 
-func keyIndexValuePrefix(collection string, idx indexState, value string) []byte {
-	return appendSegment(keyIndexPathPrefix(collection, idx), value)
+func keyIndexValuePrefix(idx indexState, value string) []byte {
+	return appendSegment(keyIndexPathPrefix(idx), value)
 }
 
-func keyUniqueIndexValuePrefix(collection string, idx indexState, value string) []byte {
-	return appendSegment(keyUniqueIndexPathPrefix(collection, idx), value)
+func keyUniqueIndexValuePrefix(idx indexState, value string) []byte {
+	return appendSegment(keyUniqueIndexPathPrefix(idx), value)
 }
 
-func keyIndex(collection string, idx indexState, value string, id int64) []byte {
-	k := keyIndexValuePrefix(collection, idx, value)
+func keyIndex(idx indexState, value string, id int64) []byte {
+	k := keyIndexValuePrefix(idx, value)
 	return appendI64(k, id)
 }
 
-func keyUniqueIndex(collection string, idx indexState, value string) []byte {
-	return keyUniqueIndexValuePrefix(collection, idx, value)
+func keyUniqueIndex(idx indexState, value string) []byte {
+	return keyUniqueIndexValuePrefix(idx, value)
 }
 
 func appendSegment(dst []byte, s string) []byte {
@@ -412,69 +408,53 @@ func readI64(src []byte, off *int) (int64, bool) {
 	return v, true
 }
 
-func decodeDocKey(key []byte) (string, int64, bool) {
+func decodeDocKey(key []byte) (int64, int64, bool) {
 	if len(key) == 0 || key[0] != keyTagDoc {
-		return "", 0, false
+		return 0, 0, false
 	}
 	off := 1
-	coll, ok := readSegment(key, &off)
+	dbid, ok := readI64(key, &off)
 	if !ok {
-		return "", 0, false
+		return 0, 0, false
 	}
 	id, ok := readI64(key, &off)
-	return coll, id, ok && off == len(key)
+	return dbid, id, ok && off == len(key)
 }
 
-func decodeIndexKey(key []byte) (collection string, kind IndexKind, path string, value string, id int64, ok bool) {
+func decodeIndexKey(key []byte) (dbid int64, value string, id int64, ok bool) {
 	if len(key) == 0 || key[0] != keyTagIdx {
-		return "", "", "", "", 0, false
+		return 0, "", 0, false
 	}
 	off := 1
-	collection, ok = readSegment(key, &off)
+	dbid, ok = readI64(key, &off)
 	if !ok {
-		return "", "", "", "", 0, false
-	}
-	kindRaw, ok := readSegment(key, &off)
-	if !ok {
-		return "", "", "", "", 0, false
-	}
-	path, ok = readSegment(key, &off)
-	if !ok {
-		return "", "", "", "", 0, false
+		return 0, "", 0, false
 	}
 	value, ok = readSegment(key, &off)
 	if !ok {
-		return "", "", "", "", 0, false
+		return 0, "", 0, false
 	}
 	id, ok = readI64(key, &off)
 	if !ok || off != len(key) {
-		return "", "", "", "", 0, false
+		return 0, "", 0, false
 	}
-	return collection, IndexKind(kindRaw), path, value, id, true
+	return dbid, value, id, true
 }
 
-func decodeUniqueIndexKey(key []byte) (collection string, kind IndexKind, path string, value string, ok bool) {
+func decodeUniqueIndexKey(key []byte) (dbid int64, value string, ok bool) {
 	if len(key) == 0 || key[0] != keyTagUIdx {
-		return "", "", "", "", false
+		return 0, "", false
 	}
 	off := 1
-	collection, ok = readSegment(key, &off)
+	dbid, ok = readI64(key, &off)
 	if !ok {
-		return "", "", "", "", false
-	}
-	kindRaw, ok := readSegment(key, &off)
-	if !ok {
-		return "", "", "", "", false
-	}
-	path, ok = readSegment(key, &off)
-	if !ok {
-		return "", "", "", "", false
+		return 0, "", false
 	}
 	value, ok = readSegment(key, &off)
 	if !ok || off != len(key) {
-		return "", "", "", "", false
+		return 0, "", false
 	}
-	return collection, IndexKind(kindRaw), path, value, true
+	return dbid, value, true
 }
 
 func prefixEnd(prefix []byte) []byte {

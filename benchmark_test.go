@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+
+	"github.com/cockroachdb/pebble"
 )
 
 func BenchmarkPutNew(b *testing.B) {
@@ -166,9 +168,148 @@ func BenchmarkUpdateDelete(b *testing.B) {
 	reportThroughput(b, 2)
 }
 
+func BenchmarkPebbleConfigs(b *testing.B) {
+	for _, cfg := range benchPebbleConfigs() {
+		b.Run(cfg.name+"/put_new", func(b *testing.B) {
+			opts, cleanup := cfg.options(filepath.Join(b.TempDir(), "put.pebble"))
+			if cleanup != nil {
+				defer cleanup()
+			}
+			db, err := Open(opts)
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			defer db.Close()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := db.PutNew("bench", []byte(fmt.Sprintf(`{"v":%d,"s":"value-%d"}`, i, i))); err != nil {
+					b.Fatalf("put: %v", err)
+				}
+			}
+			reportThroughput(b, 1)
+		})
+
+		b.Run(cfg.name+"/get_by_id", func(b *testing.B) {
+			opts, cleanup := cfg.options(filepath.Join(b.TempDir(), "get.pebble"))
+			if cleanup != nil {
+				defer cleanup()
+			}
+			db := seedBenchDBWithOptions(b, opts)
+			defer db.Close()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := db.Get("indexed", int64(i%10000+1)); err != nil {
+					b.Fatalf("get: %v", err)
+				}
+			}
+			reportThroughput(b, 1)
+		})
+
+		b.Run(cfg.name+"/indexed_query", func(b *testing.B) {
+			opts, cleanup := cfg.options(filepath.Join(b.TempDir(), "query.pebble"))
+			if cleanup != nil {
+				defer cleanup()
+			}
+			db := seedBenchDBWithOptions(b, opts)
+			defer db.Close()
+			q, _ := NewQuery("indexed", "/[v = 9000]")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res, err := db.ListQuery(q, 0)
+				if err != nil {
+					b.Fatalf("indexed query: %v", err)
+				}
+				if len(res) != 1 {
+					b.Fatalf("unexpected indexed query result count: %d", len(res))
+				}
+			}
+			reportThroughput(b, 1)
+		})
+
+		b.Run(cfg.name+"/range_query", func(b *testing.B) {
+			opts, cleanup := cfg.options(filepath.Join(b.TempDir(), "range.pebble"))
+			if cleanup != nil {
+				defer cleanup()
+			}
+			db := seedBenchDBWithOptions(b, opts)
+			defer db.Close()
+			q, _ := NewQuery("indexed", "/[v >= 100 and v < 200] | asc /v")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res, err := db.ListQuery(q, 0)
+				if err != nil {
+					b.Fatalf("range query: %v", err)
+				}
+				if len(res) != 100 {
+					b.Fatalf("unexpected range result count: %d", len(res))
+				}
+			}
+			reportThroughput(b, 100)
+		})
+	}
+}
+
+type benchPebbleConfig struct {
+	name    string
+	options func(path string) (Options, func())
+}
+
+func benchPebbleConfigs() []benchPebbleConfig {
+	cacheOptions := func(path string, cacheSize int64, memTableSize uint64, disableWAL bool, autoSync bool) (Options, func()) {
+		cache := pebble.NewCache(cacheSize)
+		opts := &pebble.Options{
+			Cache:        cache,
+			MemTableSize: memTableSize,
+			DisableWAL:   disableWAL,
+		}
+		return Options{Path: path, PebbleOptions: opts, AutoSync: autoSync}, cache.Unref
+	}
+	return []benchPebbleConfig{
+		{
+			name: "default",
+			options: func(path string) (Options, func()) {
+				return Options{Path: path}, nil
+			},
+		},
+		{
+			name: "small_cache_1m",
+			options: func(path string) (Options, func()) {
+				return cacheOptions(path, 1<<20, 1<<20, false, false)
+			},
+		},
+		{
+			name: "large_cache_64m",
+			options: func(path string) (Options, func()) {
+				return cacheOptions(path, 64<<20, 16<<20, false, false)
+			},
+		},
+		{
+			name: "sync_writes",
+			options: func(path string) (Options, func()) {
+				return cacheOptions(path, 8<<20, 4<<20, false, true)
+			},
+		},
+		{
+			name: "disable_wal",
+			options: func(path string) (Options, func()) {
+				return cacheOptions(path, 8<<20, 4<<20, true, false)
+			},
+		},
+	}
+}
+
 func seedBenchDB(b *testing.B) *DB {
 	b.Helper()
-	db, err := Open(Options{Path: filepath.Join(b.TempDir(), "query.pebble")})
+	return seedBenchDBWithOptions(b, Options{Path: filepath.Join(b.TempDir(), "query.pebble")})
+}
+
+func seedBenchDBWithOptions(b *testing.B, opts Options) *DB {
+	b.Helper()
+	db, err := Open(opts)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}

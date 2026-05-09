@@ -223,7 +223,7 @@ func TestDocumentsPersistAsJBLBinnBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := db.engine.Get(keyDoc("docs", id))
+	stored, err := db.engine.Get(keyDoc(db.state.Collections["docs"].DBID, id))
 	if err != nil {
 		t.Fatalf("read stored doc: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestJBLBinnArrayRootAndLargeContainer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := db.engine.Get(keyDoc("docs", arrID))
+	stored, err := db.engine.Get(keyDoc(db.state.Collections["docs"].DBID, arrID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestJBLBinnArrayRootAndLargeContainer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err = db.engine.Get(keyDoc("docs", bigID))
+	stored, err = db.engine.Get(keyDoc(db.state.Collections["docs"].DBID, bigID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,6 +573,92 @@ func TestReadWriteTxIsolationAndRollback(t *testing.T) {
 		_, err := tx.PutNew("users", []byte(`{"name":"no"}`))
 		if !errors.Is(err, ErrReadOnlyTx) {
 			t.Fatalf("expected read-only tx error, got %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDiskBackedStateDoesNotCacheDocuments(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	for i := 0; i < 50; i++ {
+		if _, err := db.PutNew("docs", []byte(fmt.Sprintf(`{"v":%d}`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	col := db.state.Collections["docs"]
+	if col == nil || col.RNum != 50 {
+		t.Fatalf("unexpected collection state: %+v", col)
+	}
+	if _, ok := reflect.TypeOf(*col).FieldByName("Docs"); ok {
+		t.Fatal("collectionState must not keep a Docs cache")
+	}
+}
+
+func TestWriteTxReadYourWrites(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.WriteTx(func(tx *Tx) error {
+		id, err := tx.PutNew("users", []byte(`{"name":"inside"}`))
+		if err != nil {
+			return err
+		}
+		got, err := tx.Get("users", id)
+		if err != nil {
+			return err
+		}
+		assertJSONEqual(t, got, `{"name":"inside"}`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteTxUniqueConstraintSeesPendingWrites(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if err := db.EnsureIndexMode("users", "/email", IdxUnique|IdxString); err != nil {
+		t.Fatal(err)
+	}
+	err := db.WriteTx(func(tx *Tx) error {
+		if _, err := tx.PutNew("users", []byte(`{"email":"a@example.com"}`)); err != nil {
+			return err
+		}
+		_, err := tx.PutNew("users", []byte(`{"email":"a@example.com"}`))
+		return err
+	})
+	if !errors.Is(err, ErrUniqueConstraint) {
+		t.Fatalf("expected pending unique conflict, got %v", err)
+	}
+	if meta, err := db.Meta(); err != nil {
+		t.Fatal(err)
+	} else if col := findMetaCollection(meta, "users"); col == nil || col.RNum != 0 {
+		t.Fatalf("expected rollback to keep users empty, meta=%+v", meta)
+	}
+}
+
+func TestWriteTxQuerySeesBaseAndPendingWrites(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "db.pebble"))
+	defer db.Close()
+
+	if _, err := db.PutNew("users", []byte(`{"name":"base"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteTx(func(tx *Tx) error {
+		if _, err := tx.PutNew("users", []byte(`{"name":"pending"}`)); err != nil {
+			return err
+		}
+		docs, err := tx.ListQuery(mustQuery(t, "users", "/* | asc /name"), 0)
+		if err != nil {
+			return err
+		}
+		if len(docs) != 2 {
+			t.Fatalf("expected base and pending docs, got %+v", docs)
 		}
 		return nil
 	}); err != nil {

@@ -114,7 +114,7 @@ type collectionState struct {
 	Name    string                   `json:"-"`
 	DBID    int64                    `json:"dbid"`
 	NextID  int64                    `json:"next_id"`
-	Docs    map[int64]jsontext.Value `json:"docs"`
+	RNum    int                      `json:"rnum"`
 	Indexes map[string]indexState    `json:"indexes"`
 	runtime map[string]*indexRuntime `json:"-"`
 }
@@ -124,6 +124,7 @@ type indexState struct {
 	Kind   IndexKind `json:"kind"`
 	Unique bool      `json:"unique"`
 	DBID   int64     `json:"dbid,omitempty"`
+	RNum   int       `json:"rnum,omitempty"`
 }
 
 type indexRuntime struct {
@@ -173,9 +174,6 @@ func (s *dbState) clone() (*dbState, error) {
 	}
 	for name, c := range out.Collections {
 		c.Name = name
-		if c.Docs == nil {
-			c.Docs = make(map[int64]jsontext.Value)
-		}
 		if c.Indexes == nil {
 			c.Indexes = make(map[string]indexState)
 		}
@@ -202,16 +200,16 @@ func toMeta(path string, state *dbState) Meta {
 		cm := CollectionMeta{
 			Name: name,
 			DBID: c.DBID,
-			RNum: len(c.Docs),
+			RNum: c.RNum,
 		}
-		for k, idx := range c.Indexes {
+		for _, idx := range c.Indexes {
 			cm.Indexes = append(cm.Indexes, IndexMeta{
 				Path:   idx.Path,
 				Kind:   idx.Kind,
 				Unique: idx.Unique,
 				Mode:   indexMode(idx.Kind, idx.Unique),
 				DBID:   idx.DBID,
-				RNum:   indexRuntimeRNum(c.runtime[k]),
+				RNum:   idx.RNum,
 				IDBF:   indexIDBF(idx),
 			})
 		}
